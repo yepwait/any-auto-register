@@ -12,7 +12,9 @@ from platforms.chatgpt.status_probe import (
 )
 from services.chatgpt_account_state import (
     account_plus_status,
+    account_sms_verified,
     filter_accounts_by_plus_status,
+    filter_accounts_by_sms_verified,
 )
 
 
@@ -244,6 +246,20 @@ class PlusStatusFilterTests(unittest.TestCase):
         self.assertEqual(len(filter_accounts_by_plus_status(rows, "unchecked")), 1)
         self.assertEqual(len(filter_accounts_by_plus_status(rows, "")), 3)
 
+    def test_sms_filter_treats_missing_records_as_not_verified(self):
+        rows = [
+            _Row({"sms_verification": {"verified": True}}),
+            _Row({"sms_verification": {"verified": False}}),
+            _Row({}),
+        ]
+
+        self.assertTrue(account_sms_verified(rows[0]))
+        self.assertFalse(account_sms_verified(rows[1]))
+        self.assertFalse(account_sms_verified(rows[2]))
+        self.assertEqual(filter_accounts_by_sms_verified(rows, "true"), [rows[0]])
+        self.assertEqual(filter_accounts_by_sms_verified(rows, "false"), rows[1:])
+        self.assertEqual(filter_accounts_by_sms_verified(rows, ""), rows)
+
 
 class PlusTrialEndpointTests(unittest.TestCase):
     """账号页要用到的两条链路：按 Plus 状态筛列表、跑一次检测并落库。"""
@@ -269,7 +285,10 @@ class PlusTrialEndpointTests(unittest.TestCase):
             eligible = AccountModel(
                 platform="chatgpt", email="eligible@example.com", password="pw", status="registered"
             )
-            eligible.set_extra({"plus_check": {"status": "trial_eligible", "label": "可领首月免费"}})
+            eligible.set_extra({
+                "plus_check": {"status": "trial_eligible", "label": "可领首月免费"},
+                "sms_verification": {"verified": True, "country": "1"},
+            })
             plain = AccountModel(
                 platform="chatgpt", email="plain@example.com", password="pw", status="registered"
             )
@@ -299,6 +318,13 @@ class PlusTrialEndpointTests(unittest.TestCase):
                 self.select(self.AccountModel).where(self.AccountModel.email == email)
             ).first()
             return row.get_extra()
+
+    def test_list_filters_by_sms_verification(self):
+        verified = self.client.get("/accounts", params={"sms_verified": "true"}).json()
+        unverified = self.client.get("/accounts", params={"sms_verified": "false"}).json()
+
+        self.assertEqual([item["email"] for item in verified["items"]], ["eligible@example.com"])
+        self.assertEqual([item["email"] for item in unverified["items"]], ["plain@example.com"])
 
     def test_list_filters_by_plus_status(self):
         eligible = self.client.get("/accounts", params={"plus_status": "trial_eligible"}).json()

@@ -239,6 +239,7 @@ if (cryptoMod.webcrypto && cryptoMod.webcrypto.subtle) {
   cryptoObj.subtle = cryptoMod.webcrypto.subtle;
 }
 
+// One VM/storage/listener set per input account; never reuse across accounts.
 const context = {
   console,
   setTimeout,
@@ -546,6 +547,21 @@ async function dispatchBehavior(durationMs) {
   if (remaining > 0) await new Promise(r => setTimeout(r, remaining));
 }
 
+// Clear the losing deadline on success/failure; otherwise Node stays alive after output.
+async function withTimeout(promise, timeoutMs, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ─── Main ──────────────────────────────────────────────────────
 
 (async () => {
@@ -554,10 +570,7 @@ async function dispatchBehavior(durationMs) {
 
   if (action === 'requirements') {
     try {
-      await Promise.race([
-        context.SentinelSDK.init(flow),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('init timeout')), 8000)),
-      ]);
+      await withTimeout(context.SentinelSDK.init(flow), 8000, 'init timeout');
       if (capturedProof) {
         process.stdout.write(JSON.stringify({ request_p: capturedProof }));
         return;
@@ -572,18 +585,12 @@ async function dispatchBehavior(durationMs) {
     const behaviorMs = Number(input.behavior_duration_ms || 4200);
 
     try {
-      const mainToken = await Promise.race([
-        context.SentinelSDK.token(flow),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('SDK token timeout')), 8000)),
-      ]);
+      const mainToken = await withTimeout(context.SentinelSDK.token(flow), 8000, 'SDK token timeout');
       if (mainToken) {
         await dispatchBehavior(behaviorMs);
         let soToken = '';
         try {
-          soToken = await Promise.race([
-            context.SentinelSDK.sessionObserverToken(flow),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('SO timeout')), 5000)),
-          ]);
+          soToken = await withTimeout(context.SentinelSDK.sessionObserverToken(flow), 5000, 'SO timeout');
         } catch (_) {
           soToken = '';
         }

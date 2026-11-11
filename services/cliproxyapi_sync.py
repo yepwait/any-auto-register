@@ -17,6 +17,21 @@ SYNC_RETRY_ATTEMPTS = 3
 SYNC_RETRY_DELAY_SECONDS = 0.4
 BATCH_PROBE_DELAY_SECONDS = 0.12
 
+# CPA auth-file 可能仍能用旧 AT 调用接口，但自动刷新链已要求重新登录。
+_RELOGIN_MARKERS = (
+    "需要重新登录",
+    "请重新登录",
+    "需重登",
+    "重新登入",
+    "relogin",
+    "re-auth",
+    "reauth",
+    "login required",
+    "authentication required",
+    "refresh token expired",
+    "refresh failed",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -179,6 +194,22 @@ def _status_rank(status: str) -> int:
     return order.get(str(status or "").strip().lower(), 9)
 
 
+def _auth_file_requires_relogin(auth_file: dict[str, Any]) -> bool:
+    if not isinstance(auth_file, dict):
+        return False
+    if auth_file.get("requires_relogin") is True or auth_file.get("need_relogin") is True:
+        return True
+    status = str(auth_file.get("status") or "").strip().lower()
+    # 备注：CPA 面板的 error 就是凭据刷新失败，不能被旧 AT 的 200 探测结果洗成可用。
+    if status in {"error", "relogin_required", "reauth_required", "needs_login", "expired", "invalid"}:
+        return True
+    text = " ".join(
+        str(auth_file.get(key) or "").strip().lower()
+        for key in ("status", "status_message", "message", "error", "error_message")
+    )
+    return any(marker in text for marker in _RELOGIN_MARKERS)
+
+
 def _match_auth_file(account: Any, files: list[dict[str, Any]]) -> dict[str, Any] | None:
     email = str(getattr(account, "email", "") or "").strip().lower()
     if not email:
@@ -323,7 +354,11 @@ def _build_remote_sync_result(
             }
         )
         return remote
-    if remote["status"] == "error" and remote["status_message"]:
+    if _auth_file_requires_relogin(matched):
+        # 备注：旧 AT 可能仍能返回 200，但 CPA 已明确无法自动续期，需优先显示重登。
+        remote["remote_state"] = "relogin_required"
+        remote["message"] = remote["status_message"] or "CLIProxyAPI 要求重新登录"
+    elif remote["status"] == "error" and remote["status_message"]:
         remote["message"] = remote["status_message"]
     elif remote["last_probe_message"]:
         remote["message"] = remote["last_probe_message"]

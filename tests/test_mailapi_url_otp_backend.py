@@ -63,9 +63,10 @@ def test_missing_url_is_reported_instead_of_silently_polling_nothing():
         backend._fetch_mailapi_text(account)
 
 
-def test_mailapi_accounts_route_to_the_mailapi_backend():
-    """池子里 OAuth 和 MailAPI 是混着放的，选后端只能看账号自己的类型。"""
+def test_mailapi_accounts_route_to_the_mailapi_backend(monkeypatch):
+    """路由测试不发真实 OAuth 请求；认证能力另由 mock 的 OAuth 测试覆盖。"""
     mailbox = OutlookMailbox()
+    monkeypatch.setattr(mailbox, "_get_oauth_access_token", lambda *_args, **_kwargs: "mock-graph-token")
 
     assert mailbox._resolve_backend(_mailapi_account()) is mailbox._backends["mailapi_url"]
 

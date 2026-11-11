@@ -100,6 +100,12 @@ class MailboxProviderAdapterTests(unittest.TestCase):
         self.assertEqual(kwargs["before_ids"], {"mid-1"})
         self.assertEqual(kwargs["otp_sent_at"], 1234.5)
         self.assertEqual(kwargs["timeout"], 45)
+        self.assertEqual(kwargs["exclude_codes"], set())
+
+        # 备注：协议重发 OTP 时，邮箱后端必须跳过上一轮已失败的验证码。
+        adapter.wait_for_otp("demo@example.com", timeout=45, issued_after=1240.0)
+        _, retry_kwargs = mailbox.wait_calls[1]
+        self.assertEqual(retry_kwargs["exclude_codes"], {"123456"})
 
     def test_configured_timeout_overrides_protocol_request(self):
         mailbox = _StubMailbox(ids=set())

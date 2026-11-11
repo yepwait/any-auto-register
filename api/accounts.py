@@ -9,7 +9,7 @@ from services.account_export import (
     list_export_formats,
     render_accounts,
 )
-from services.chatgpt_account_state import filter_accounts_by_plus_status
+from services.chatgpt_account_state import filter_accounts_by_plus_status, filter_accounts_by_sms_verified
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
@@ -52,6 +52,7 @@ class ExportTextRequest(BaseModel):
     status: str = ""
     email: str = ""
     plus_status: str = ""
+    sms_verified: str = ""
     created_at_start: Optional[datetime] = None
     created_at_end: Optional[datetime] = None
 
@@ -63,6 +64,7 @@ def _filtered_accounts(
     status: str = "",
     email: str = "",
     plus_status: str = "",
+    sms_verified: str = "",
     created_at_start: Optional[datetime] = None,
     created_at_end: Optional[datetime] = None,
 ) -> list[AccountModel]:
@@ -80,6 +82,8 @@ def _filtered_accounts(
     rows = list(session.exec(q).all())
     if plus_status:
         rows = list(filter_accounts_by_plus_status(rows, plus_status))
+    if sms_verified:
+        rows = list(filter_accounts_by_sms_verified(rows, sms_verified))
     return rows
 
 
@@ -89,6 +93,7 @@ def list_accounts(
     status: Optional[str] = None,
     email: Optional[str] = None,
     plus_status: Optional[str] = None,
+    sms_verified: Optional[str] = None,
     created_at_start: Optional[datetime] = None,
     created_at_end: Optional[datetime] = None,
     page: int = 1,
@@ -103,6 +108,7 @@ def list_accounts(
         status=status or "",
         email=email or "",
         plus_status=plus_status or "",
+        sms_verified=sms_verified or "",
         created_at_start=created_at_start,
         created_at_end=created_at_end,
     )
@@ -189,6 +195,7 @@ def export_accounts_text(body: ExportTextRequest, session: Session = Depends(get
             status=body.status,
             email=body.email,
             plus_status=body.plus_status,
+            sms_verified=body.sms_verified,
             created_at_start=body.created_at_start,
             created_at_end=body.created_at_end,
         )

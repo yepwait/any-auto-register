@@ -18,8 +18,9 @@ chmod 700 "$(dirname "${CREDENTIAL_ENCRYPTION_KEY_FILE:-${RUNTIME_DIR}/.secrets/
 
 ln -sfn "${RUNTIME_DIR}/account_manager.db" "${APP_DIR}/account_manager.db"
 
-if ! command -v node >/dev/null 2>&1; then
-  echo "[entrypoint] 警告: 找不到 node，ChatGPT 的 Sentinel PoW 无法求解，注册会收不到验证码" >&2
+if ! command -v node >/dev/null 2>&1 || ! node --version >/dev/null 2>&1; then
+  echo "[entrypoint] 错误: node 不可用，ChatGPT 的 Sentinel PoW 无法求解；拒绝启动" >&2
+  exit 1
 fi
 
 echo "[entrypoint] Starting backend (headless, solver disabled)"

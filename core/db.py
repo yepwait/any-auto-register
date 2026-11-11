@@ -69,12 +69,25 @@ class TaskRunModel(SQLModel, table=True):
     skipped: int = 0
     error: str = ""
     meta_json: str = "{}"
-    logs_json: str = "[]"
+    logs_json: str = "[]"  # legacy rows only; new log lines live in task_run_logs
+    log_count: int = 0
+    error_count: int = 0
+    logs_version: int = 0
     errors_json: str = "[]"
     cashier_urls_json: str = "[]"
     control_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class TaskRunLogModel(SQLModel, table=True):
+    """Append-only log lines; legacy task_runs.logs_json stays readable."""
+    __tablename__ = "task_run_logs"
+
+    task_id: str = Field(primary_key=True)
+    sequence: int = Field(primary_key=True)
+    line: str
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class OutlookAccountModel(SQLModel, table=True):
@@ -244,8 +257,29 @@ def _migrate_icloud_aliases_schema() -> None:
             session.commit()
 
 
+def _migrate_task_log_storage() -> None:
+    """Additive migration; old logs remain intact for backward reads/rollback."""
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    with engine.begin() as connection:
+        columns = {str(row[1]) for row in connection.exec_driver_sql("PRAGMA table_info('task_runs')")}
+        for name in ("log_count", "error_count", "logs_version"):
+            if name not in columns:
+                connection.exec_driver_sql(f"ALTER TABLE task_runs ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0")
+        # Populate only counters, leaving all legacy JSON unchanged for rollback.
+        # JSON1 is available on supported SQLite; tolerate older builds gracefully.
+        try:
+            connection.exec_driver_sql("UPDATE task_runs SET log_count=json_array_length(logs_json) WHERE logs_version=0 AND log_count=0 AND json_valid(logs_json)")
+            connection.exec_driver_sql("UPDATE task_runs SET error_count=json_array_length(errors_json) WHERE error_count=0 AND json_valid(errors_json)")
+        except Exception:
+            pass
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_task_runs_source_created ON task_runs(source, created_at)")
+        connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_task_runs_status_created ON task_runs(status, created_at)")
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
+    _migrate_task_log_storage()
     _migrate_outlook_accounts_schema()
     _migrate_icloud_aliases_schema()
 

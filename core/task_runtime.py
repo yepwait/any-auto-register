@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import threading
 import time
+import os
 from typing import Any
 
 
@@ -151,6 +152,9 @@ class RegisterTaskRecord:
     status: str = "pending"
     progress: str = "0/0"
     logs: list[str] = field(default_factory=list)
+    log_offset: int = 0
+    log_count: int = 0
+    log_bytes: int = 0
     success: int = 0
     registered: int = 0
     skipped: int = 0
@@ -164,7 +168,7 @@ class RegisterTaskRecord:
         repr=False,
     )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_logs: bool = True) -> dict[str, Any]:
         data = {
             "id": self.id,
             "status": self.status,
@@ -173,7 +177,9 @@ class RegisterTaskRecord:
             "meta": dict(self.meta),
             "total": self.total,
             "progress": self.progress,
-            "logs": list(self.logs),
+            "logs": list(self.logs) if include_logs else [],
+            "log_offset": self.log_offset,
+            "log_count": self.log_count,
             "success": self.success,
             "registered": self.registered,
             "skipped": self.skipped,
@@ -197,11 +203,20 @@ class RegisterTaskStore:
         *,
         max_finished_tasks: int = 200,
         cleanup_threshold: int = 250,
+        max_log_lines: int | None = None,
+        max_log_bytes: int | None = None,
     ):
         self._lock = threading.Lock()
         self._records: dict[str, RegisterTaskRecord] = {}
         self.max_finished_tasks = max_finished_tasks
         self.cleanup_threshold = cleanup_threshold
+        def limit(value, env_key, default, minimum):
+            try:
+                return max(minimum, int(value if value is not None else os.getenv(env_key, str(default))))
+            except (TypeError, ValueError):
+                return default
+        self.max_log_lines = limit(max_log_lines, "APP_TASK_LOG_TAIL_LINES", 2000, 1)
+        self.max_log_bytes = limit(max_log_bytes, "APP_TASK_LOG_TAIL_BYTES", 1048576, 256)
 
     def create(
         self,
@@ -228,6 +243,10 @@ class RegisterTaskStore:
         with self._lock:
             return task_id in self._records
 
+    def remove(self, task_id: str) -> None:
+        with self._lock:
+            self._records.pop(task_id, None)
+
     def has_active(
         self,
         *,
@@ -249,6 +268,11 @@ class RegisterTaskStore:
         with self._lock:
             return self._records[task_id].control
 
+    def bind_control(self, task_id: str, control: RegisterTaskControl) -> None:
+        """父子任务共享中断开关，任一入口停止都能传递到真实执行链。"""
+        with self._lock:
+            self._records[task_id].control = control
+
     def request_stop(self, task_id: str) -> dict[str, Any]:
         control = self.control_for(task_id)
         control.request_stop()
@@ -259,13 +283,36 @@ class RegisterTaskStore:
         control.request_skip_current()
         return control.snapshot()
 
-    def append_log(self, task_id: str, entry: str) -> None:
+    def append_log(self, task_id: str, entry: str) -> int | None:
         with self._lock:
             record = self._records.get(task_id)
             if record is None:
-                return
+                return None
+            sequence = record.log_count
+            record.log_count += 1
             record.logs.append(entry)
+            record.log_bytes += len(entry.encode("utf-8"))
+            while len(record.logs) > self.max_log_lines or (record.log_bytes > self.max_log_bytes and len(record.logs) > 1):
+                removed = record.logs.pop(0)
+                record.log_bytes -= len(removed.encode("utf-8"))
+                record.log_offset += 1
             record.updated_at = time.time()
+            return sequence
+
+    def parent_task_id(self, task_id: str) -> str | None:
+        with self._lock:
+            record = self._records.get(task_id)
+            return (record.meta.get("parent_task_id") if record else None)
+
+    def log_slice(self, task_id: str, since: int = 0, limit: int = 500) -> dict[str, Any]:
+        """Absolute cursors survive tail eviction and client reconnects."""
+        with self._lock:
+            record = self._records[task_id]
+            start = max(record.log_offset, since)
+            lines = record.logs[start - record.log_offset:start - record.log_offset + max(1, limit)]
+            return {"logs": list(lines), "log_offset": start, "next_since": start + len(lines),
+                    "log_count": record.log_count, "status": record.status,
+                    "success": record.success, "registered": record.registered, "total": record.total}
 
     def update_meta(self, task_id: str, patch: dict[str, Any]) -> None:
         with self._lock:
@@ -343,13 +390,13 @@ class RegisterTaskStore:
             record.error = error
             record.updated_at = time.time()
 
-    def snapshot(self, task_id: str) -> dict[str, Any]:
+    def snapshot(self, task_id: str, *, include_logs: bool = True) -> dict[str, Any]:
         with self._lock:
-            return self._records[task_id].to_dict()
+            return self._records[task_id].to_dict(include_logs=include_logs)
 
-    def list_snapshots(self) -> list[dict[str, Any]]:
+    def list_snapshots(self, *, include_logs: bool = False) -> list[dict[str, Any]]:
         with self._lock:
-            return [record.to_dict() for record in self._records.values()]
+            return [record.to_dict(include_logs=include_logs) for record in self._records.values()]
 
     def log_state(self, task_id: str) -> tuple[list[str], str]:
         with self._lock:

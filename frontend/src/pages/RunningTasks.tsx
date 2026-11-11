@@ -8,6 +8,7 @@ import {
   Empty,
   message,
   Popconfirm,
+  Pagination,
   Progress,
   Row,
   Space,
@@ -24,6 +25,7 @@ import { getPlatformColor, getPlatformLabel } from '@/lib/platforms'
 import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import type { TaskKind } from '@/components/TaskLogPanel'
+import { usePollingRequest } from '@/hooks/usePollingRequest'
 
 const { Text, Title } = Typography
 
@@ -31,16 +33,30 @@ interface TaskSnapshot {
   id: string
   platform: string
   source: string
+  kind?: string
+  meta?: { kind?: string }
   status: 'pending' | 'running' | 'done' | 'failed' | 'stopped'
   total: number
   progress: string
   success: number
   registered: number
   skipped: number
-  errors: string[]
+  errors?: string[]
+  error_count?: number
   created_at: number | string | null
   updated_at: number | string | null
   control: { stop_requested: boolean }
+}
+
+interface TaskPage {
+  items: TaskSnapshot[]
+  total: number
+}
+
+const TASK_PAGE_SIZE = 50
+
+function isActive(task: TaskSnapshot) {
+  return task.status === 'running' || task.status === 'pending'
 }
 
 const SOURCE_LABELS: Record<string, string> = {
@@ -50,9 +66,25 @@ const SOURCE_LABELS: Record<string, string> = {
   backfill_rt: '补 RT',
   bind_2fa: '绑 2FA',
   payment: '支付',
+  inspection: '巡检',
+  sms_stock: '接码自动补库',
+  sms_stock_register: '补库注册子任务',
+  chatgpt_web_pool: 'Web 池巡检',
+  chatgpt_web_pool_register: 'Web 池邮箱注册子任务',
 }
 
-const STATUS_CONFIG: Record<string, { color: string; label: string; icon?: React.ReactNode }> = {
+const LOG_KINDS: Record<string, TaskKind> = {
+  backfill_rt: 'backfill_rt',
+  bind_2fa: 'bind_2fa',
+  payment: 'payment',
+  inspection: 'inspection',
+  sms_stock: 'sms_stock',
+  sms_stock_register: 'register',
+  chatgpt_web_pool: 'chatgpt_web_pool',
+  chatgpt_web_pool_register: 'chatgpt_web_pool_register',
+}
+
+const STATUS_CONFIG: Record<string, { color: 'default' | 'processing' | 'success' | 'error' | 'warning'; label: string; icon?: React.ReactNode }> = {
   pending: { color: 'default', label: '等待中', icon: <LoadingOutlined /> },
   running: { color: 'processing', label: '运行中', icon: <LoadingOutlined /> },
   done: { color: 'success', label: '已完成' },
@@ -91,65 +123,79 @@ function formatDuration(startTs: unknown, endTs?: unknown): string {
 }
 
 export default function RunningTasks() {
-  const [tasks, setTasks] = useState<TaskSnapshot[]>([])
-  const [loading, setLoading] = useState(false)
+  const [activeTasks, setActiveTasks] = useState<TaskSnapshot[]>([])
+  const [finishedTasks, setFinishedTasks] = useState<TaskSnapshot[]>([])
+  const [activePage, setActivePage] = useState(1)
+  const [activeTotal, setActiveTotal] = useState(0)
+  const [page, setPage] = useState(1)
+  const [finishedTotal, setFinishedTotal] = useState(0)
+  const [loadError, setLoadError] = useState('')
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now() / 1000)
 
-  const load = useCallback(async () => {
-    setLoading(true)
-    try {
-      const data = (await apiFetch('/tasks')) as TaskSnapshot[]
-      // sort: running first, then pending, then finished (newest first)
-      const order = { running: 0, pending: 1, done: 2, failed: 3, stopped: 4 }
-      const sorted = [...(data || [])].sort((a, b) => {
-        const oa = order[a.status] ?? 9
-        const ob = order[b.status] ?? 9
-        if (oa !== ob) return oa - ob
-        const ta = toUnixSeconds(a.created_at) ?? 0
-        const tb = toUnixSeconds(b.created_at) ?? 0
-        return tb - ta
-      })
-      setTasks(sorted)
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+  const requestTasks = useCallback(async (signal: AbortSignal) => {
+    // Active work has its own query, so old completed records never push it off the page.
+    const [active, finished] = await Promise.all([
+      apiFetch(`/tasks/page?status=active&limit=${TASK_PAGE_SIZE}&offset=${(activePage - 1) * TASK_PAGE_SIZE}`, { signal }) as Promise<TaskPage>,
+      apiFetch(`/tasks/page?status=finished&limit=${TASK_PAGE_SIZE}&offset=${(page - 1) * TASK_PAGE_SIZE}`, { signal }) as Promise<TaskPage>,
+    ])
+    return { active, finished }
+  }, [activePage, page])
+  const { loading, refresh: load, getSignal } = usePollingRequest({
+    request: requestTasks,
+    intervalMs: 2500,
+    onSuccess: ({ active, finished }) => {
+      setActiveTasks(active.items || [])
+      setActiveTotal(active.total || 0)
+      setFinishedTasks(finished.items || [])
+      setFinishedTotal(finished.total || 0)
+      setLoadError('')
+      setActivePage(current => Math.min(current, Math.max(1, Math.ceil(active.total / TASK_PAGE_SIZE))))
+      setPage(current => Math.min(current, Math.max(1, Math.ceil(finished.total / TASK_PAGE_SIZE))))
+    },
+    onError: error => setLoadError(error instanceof Error ? error.message : '加载任务失败'),
+  })
 
   useEffect(() => {
-    load()
-    const poll = setInterval(() => {
-      load()
+    if (!activeTotal) return
+    let tick: number | undefined
+    const updateTick = () => {
+      window.clearInterval(tick)
+      if (document.hidden) return
       setNow(Date.now() / 1000)
-    }, 2500)
-    // tick every second for live duration
-    const tick = setInterval(() => setNow(Date.now() / 1000), 1000)
-    return () => {
-      clearInterval(poll)
-      clearInterval(tick)
+      tick = window.setInterval(() => setNow(Date.now() / 1000), 1000)
     }
-  }, [load])
+    updateTick()
+    document.addEventListener('visibilitychange', updateTick)
+    return () => {
+      window.clearInterval(tick)
+      document.removeEventListener('visibilitychange', updateTick)
+    }
+  }, [activeTotal])
 
-  const isActive = (t: TaskSnapshot) => t.status === 'running' || t.status === 'pending'
-  const activeTasks = tasks.filter(isActive)
-  const finishedTasks = tasks.filter((t) => !isActive(t))
-  const logTask = logTaskId ? tasks.find((task) => task.id === logTaskId) : null
+  const logTask = logTaskId ? [...activeTasks, ...finishedTasks].find(task => task.id === logTaskId) : null
+  const logKind = logTask?.kind || logTask?.meta?.kind || ''
 
   const handleDelete = async (taskId: string) => {
+    const signal = getSignal()
+    if (!signal || signal.aborted) return
     try {
-      await apiFetch(`/tasks/${taskId}`, { method: 'DELETE' })
+      await apiFetch(`/tasks/${taskId}`, { method: 'DELETE', signal })
+      if (signal.aborted) return
       if (logTaskId === taskId) setLogTaskId(null)
-      setTasks((prev) => prev.filter((t) => t.id !== taskId))
+      setFinishedTasks(previous => previous.filter(task => task.id !== taskId))
       message.success('任务已删除')
+      // The page refresh deduplicates against a poll already in flight.
+      await load()
     } catch (error) {
-      const detail = error instanceof Error ? error.message : '删除失败'
-      message.error(detail)
+      if (!signal.aborted) message.error(error instanceof Error ? error.message : '删除失败')
     }
   }
 
   const renderTask = (task: TaskSnapshot) => {
+    const kind = task.kind || task.meta?.kind || ''
     const cfg = STATUS_CONFIG[task.status] || { color: 'default', label: task.status }
-    const failed = task.errors?.length ?? 0
+    const failed = task.error_count ?? task.errors?.length ?? 0
     const totalRaw = Number(task.total)
     const doneRaw = Number(task.registered)
     const success = Number.isFinite(Number(task.success)) ? Number(task.success) : 0
@@ -181,7 +227,7 @@ export default function RunningTasks() {
                   {getPlatformLabel(task.platform)}
                 </Tag>
                 <Text type="secondary" style={{ fontSize: 11 }}>
-                  {SOURCE_LABELS[task.source] || task.source || '-'}
+                  {SOURCE_LABELS[kind] || SOURCE_LABELS[task.source] || kind || task.source || '-'}
                 </Text>
               </Space>
             </Space>
@@ -189,7 +235,7 @@ export default function RunningTasks() {
 
           {/* Status */}
           <Col flex="90px">
-            <Badge status={cfg.color as any} text={cfg.label} />
+            <Badge status={cfg.color} text={cfg.label} />
           </Col>
 
           {/* Duration */}
@@ -282,6 +328,8 @@ export default function RunningTasks() {
         </Button>
       </div>
 
+      {loadError && <Text type="danger" style={{ display: 'block', marginBottom: 12 }}>{loadError}</Text>}
+
       {/* Active tasks */}
       {activeTasks.length > 0 && (
         <div style={{ marginBottom: 24 }}>
@@ -289,9 +337,13 @@ export default function RunningTasks() {
             strong
             style={{ display: 'block', marginBottom: 8, fontSize: 13, color: 'var(--accent)' }}
           >
-            进行中 ({activeTasks.length})
+            进行中 ({activeTotal})
           </Text>
           {activeTasks.map(renderTask)}
+          {activeTotal > TASK_PAGE_SIZE && <Pagination
+            current={activePage} total={activeTotal} pageSize={TASK_PAGE_SIZE} showSizeChanger={false}
+            onChange={setActivePage} disabled={loading} size="small"
+          />}
         </div>
       )}
 
@@ -302,13 +354,18 @@ export default function RunningTasks() {
             strong
             style={{ display: 'block', marginBottom: 8, fontSize: 13, color: 'var(--text-muted)' }}
           >
-            已完成 ({finishedTasks.length})
+            已结束 ({finishedTotal}) · 每页 {TASK_PAGE_SIZE} 条摘要，翻页查看历史
           </Text>
           {finishedTasks.map(renderTask)}
         </div>
       )}
+      {finishedTotal > TASK_PAGE_SIZE && <Pagination
+        current={page} total={finishedTotal} pageSize={TASK_PAGE_SIZE} showSizeChanger={false}
+        onChange={setPage} disabled={loading} showTotal={total => `共 ${total} 条已结束任务`}
+        style={{ marginTop: 16, textAlign: 'right' }}
+      />}
 
-      {tasks.length === 0 && !loading && (
+      {activeTasks.length === 0 && finishedTasks.length === 0 && !loading && !loadError && (
         <Empty description="暂无任务记录" style={{ marginTop: 60 }} />
       )}
 
@@ -331,7 +388,9 @@ export default function RunningTasks() {
         destroyOnClose
         bodyStyle={{ padding: 16 }}
       >
-        {logTaskId && <TaskLogPanel taskId={logTaskId} kind={(logTask?.source || 'register') as TaskKind} />}
+        {logTaskId && <TaskLogPanel taskId={logTaskId} kind={
+          LOG_KINDS[logKind] || LOG_KINDS[logTask?.source || ''] || 'register'
+        } />}
       </Drawer>
     </div>
   )

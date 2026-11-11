@@ -38,6 +38,11 @@ def sync_account(account) -> list[dict[str, Any]]:
 
     platform = getattr(account, "platform", "")
     results: list[dict[str, Any]] = []
+    from services.chatgpt_account_purpose import is_web_pool_account
+
+    if platform == "chatgpt" and is_web_pool_account(account):
+        # Web 池凭证只能由专用同步上传，不能被全局 CPA/贡献开关带到其它目标。
+        return results
 
     def _build_chatgpt_upload_account():
         class _A:

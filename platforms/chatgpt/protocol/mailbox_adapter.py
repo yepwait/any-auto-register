@@ -45,6 +45,7 @@ class MailboxProviderAdapter(MailProvider):
         self._fixed_email = (fixed_email or "").strip()
         self._account: Optional[MailboxAccount] = None
         self._before_ids: set = set()
+        self._attempted_codes: set[str] = set()
         self._dead = False
         self._otp_timeout = otp_timeout
         self.kind = kind
@@ -118,9 +119,12 @@ class MailboxProviderAdapter(MailProvider):
             timeout=self._resolve_timeout(timeout),
             before_ids=self._before_ids,
             otp_sent_at=issued_after,
+            # 备注：重发后不能再次提交上一轮已被 OpenAI 拒绝的验证码。
+            exclude_codes=set(self._attempted_codes),
         )
         if not code:
             raise TimeoutError(f"{self.kind} 未取到验证码")
+        self._attempted_codes.add(str(code).strip())
         return code
 
     def mark_dead(self, reason: str = "") -> None:

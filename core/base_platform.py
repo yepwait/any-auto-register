@@ -13,6 +13,9 @@ class AccountStatus(str, Enum):
     SUBSCRIBED   = "subscribed"
     EXPIRED      = "expired"
     INVALID      = "invalid"
+    # 备注：OpenAI 明确回 "账号已被删除或停用" 时单独记一档，别和普通失效混在一起
+    # （补 RT/协议重登撞 403 也会落到这里，见 services/chatgpt_account_state.py）。
+    DELETED      = "deleted"
 
 
 @dataclass

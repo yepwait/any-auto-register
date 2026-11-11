@@ -109,6 +109,7 @@ CONFIG_KEYS = [
     "sms_country",
     "sms_auto_country",
     "sms_allowed_countries",
+    "sms_blocked_countries",
     "sms_auto_min_stock",
     "sms_auto_max_price",
     "sms_max_price",
@@ -184,6 +185,9 @@ def get_config():
         all_cfg["sms_service"] = SMS_DEFAULT_SERVICE
     if not all_cfg.get("sms_country"):
         all_cfg["sms_country"] = SMS_DEFAULT_COUNTRY
+    # 备注：黑名单为空表示不额外屏蔽国家，兼容历史配置。
+    if "sms_blocked_countries" not in all_cfg:
+        all_cfg["sms_blocked_countries"] = ""
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 

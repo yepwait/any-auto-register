@@ -38,25 +38,44 @@ def main() -> None:
             shutil.rmtree(install_dir)
         install_dir.mkdir(parents=True, exist_ok=True)
 
+        # Camoufox 0.5+ only activates browsers registered under this versioned path.
+        version_key = f"{version}-{release}"
+        version_dir = install_dir / "browsers" / "official" / version_key
+        version_dir.mkdir(parents=True, exist_ok=True)
+
         archive_path = temp_dir / asset_name
         print(f"Downloading Camoufox package: {asset_url}")
         urllib.request.urlretrieve(asset_url, archive_path)
         with zipfile.ZipFile(archive_path) as zf:
-            zf.extractall(install_dir)
+            zf.extractall(version_dir)
 
-        version_path = install_dir / "version.json"
+        version_path = version_dir / "version.json"
         version_path.write_text(
             json.dumps({"version": version, "release": release}),
             encoding="utf-8",
         )
+        (install_dir / "config.json").write_text(
+            json.dumps({"active_version": f"browsers/official/{version_key}"}),
+            encoding="utf-8",
+        )
+        # Camoufox 0.5+ uses this marker to keep the preloaded browser install.
+        (install_dir / ".0.5_FLAG").touch()
 
-        addon_dir = install_dir / "addons" / "UBO"
+        addon_dir = version_dir / "addons" / "UBO"
         addon_dir.mkdir(parents=True, exist_ok=True)
         addon_path = temp_dir / "ublock-origin.xpi"
         print(f"Downloading default addon UBO: {addon_url}")
-        urllib.request.urlretrieve(addon_url, addon_path)
-        with zipfile.ZipFile(addon_path) as zf:
-            zf.extractall(addon_dir)
+        try:
+            request = urllib.request.Request(
+                addon_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; Camoufox installer)"},
+            )
+            with urllib.request.urlopen(request, timeout=60) as response, addon_path.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            with zipfile.ZipFile(addon_path) as zf:
+                zf.extractall(addon_dir)
+        except Exception as exc:  # noqa: BLE001 - UBO is optional and may be blocked upstream
+            print(f"Warning: skipped optional UBO addon: {type(exc).__name__}: {exc}")
 
         for path in install_dir.rglob("*"):
             if path.is_dir():
@@ -64,7 +83,7 @@ def main() -> None:
             else:
                 path.chmod(0o644)
 
-        binary = install_dir / "camoufox-bin"
+        binary = version_dir / "camoufox-bin"
         if binary.exists():
             binary.chmod(0o755)
     finally:

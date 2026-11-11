@@ -24,6 +24,9 @@ from api.icloud import router as icloud_router
 from api.shared_mail import router as shared_mail_router
 from api.sms import router as sms_router
 from api.payments import router as payments_router
+from api.inspection import router as inspection_router
+from api.sms_stock import router as sms_stock_router
+from api.chatgpt_web_pool import router as chatgpt_web_pool_router
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
 
@@ -63,6 +66,12 @@ def _print_runtime_info() -> None:
 async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
+    # 服务重启后，清理数据库中无法由当前进程继续执行的 pending/running 任务。
+    from api.tasks import _finalize_orphan_tasks, start_task_persistence
+    _finalize_orphan_tasks()
+    start_task_persistence()
+    from services.background_jobs import start_background_jobs
+    start_background_jobs()
     load_all()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms
@@ -71,11 +80,20 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     from services.solver_manager import start_async
     start_async()
-    yield
-    from core.scheduler import scheduler as _scheduler
-    _scheduler.stop()
-    from services.solver_manager import stop
-    stop()
+    try:
+        yield
+    finally:
+        from core.scheduler import scheduler as _scheduler
+        _scheduler.stop()
+        from api.tasks import stop_task_producers
+        stop_task_producers()
+        # Flush accepted uploads/TaskLogs before the final append-log batch.
+        from services.background_jobs import shutdown_background_jobs
+        shutdown_background_jobs()
+        from api.tasks import stop_task_persistence
+        stop_task_persistence()
+        from services.solver_manager import stop
+        stop()
 
 
 app = FastAPI(title="any-auto-register", version="1.0.0", lifespan=lifespan)
@@ -85,6 +103,9 @@ app = FastAPI(title="any-auto-register", version="1.0.0", lifespan=lifespan)
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
+        return await call_next(request)
+    # Webhook trigger uses its own secret; skip panel JWT check for this endpoint.
+    if path == "/api/chatgpt-web-pool/trigger":
         return await call_next(request)
     from core.config_store import config_store as _cs
     if not _cs.get("auth_password_hash", ""):
@@ -127,6 +148,9 @@ app.include_router(contribution_router, prefix="/api")
 app.include_router(icloud_router, prefix="/api")
 app.include_router(sms_router, prefix="/api")
 app.include_router(payments_router, prefix="/api")
+app.include_router(inspection_router, prefix="/api")
+app.include_router(sms_stock_router, prefix="/api")
+app.include_router(chatgpt_web_pool_router, prefix="/api")
 # 隐私邮箱的免登录邮件页，不带 /api 前缀就绕开了鉴权中间件
 app.include_router(shared_mail_router)
 

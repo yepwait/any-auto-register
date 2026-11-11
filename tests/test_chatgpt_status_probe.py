@@ -56,6 +56,9 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
                 error_code="token_invalidated",
                 message="invalidated",
             ),
+        ), mock.patch(
+            "platforms.chatgpt.token_refresh.TokenRefreshManager.refresh_by_session_token",
+            return_value=type("Refresh", (), {"success": False})(),
         ):
             result = probe_local_chatgpt_status(account)
 
@@ -111,6 +114,44 @@ class ChatGPTStatusProbeTests(unittest.TestCase):
         self.assertEqual(result["auth"]["state"], "access_token_valid")
         self.assertEqual(result["subscription"]["plan"], "plus")
         self.assertEqual(result["codex"]["state"], "quota_exhausted")
+
+    def test_session_failure_falls_back_to_rt_with_account_client_id(self):
+        from platforms.chatgpt.token_refresh import TokenRefreshResult
+
+        account = DummyAccount(token="old", refresh_token="rt", session_token="session", user_id="acct")
+        account.client_id = "account-client"
+        rejected = ProbeHTTPResult(401, {}, "", {}, "", "unauthorized")
+        valid = ProbeHTTPResult(200, {}, "{}", {"plan_type": "free"}, "", "ok")
+        with mock.patch("platforms.chatgpt.status_probe._probe_backend_me", side_effect=[rejected, valid]), mock.patch(
+            "platforms.chatgpt.status_probe._probe_codex_usage", return_value=valid
+        ), mock.patch(
+            "platforms.chatgpt.token_refresh.TokenRefreshManager.refresh_by_session_token",
+            return_value=TokenRefreshResult(success=False),
+        ), mock.patch(
+            "platforms.chatgpt.token_refresh.TokenRefreshManager.refresh_by_oauth_token",
+            return_value=TokenRefreshResult(success=True, access_token="new", refresh_token="new-rt"),
+        ) as oauth:
+            result = probe_local_chatgpt_status(account)
+        oauth.assert_called_once_with("rt", client_id="account-client")
+        self.assertEqual(result["auth"]["state"], "access_token_valid")
+        self.assertEqual(account.token, "new")
+        self.assertEqual(account.extra["refresh_token"], "new-rt")
+        self.assertEqual(len(result["auth"]["refresh_attempts"]), 2)
+
+    def test_missing_at_can_be_recovered_by_rt(self):
+        from platforms.chatgpt.token_refresh import TokenRefreshResult
+
+        account = DummyAccount(refresh_token="rt", user_id="acct")
+        valid = ProbeHTTPResult(200, {}, "{}", {"plan_type": "free"}, "", "ok")
+        with mock.patch("platforms.chatgpt.status_probe._probe_backend_me", return_value=valid), mock.patch(
+            "platforms.chatgpt.status_probe._probe_codex_usage", return_value=valid
+        ), mock.patch(
+            "platforms.chatgpt.token_refresh.TokenRefreshManager.refresh_by_oauth_token",
+            return_value=TokenRefreshResult(success=True, access_token="new"),
+        ):
+            result = probe_local_chatgpt_status(account)
+        self.assertEqual(result["auth"]["state"], "access_token_valid")
+        self.assertEqual(account.token, "new")
 
 
 if __name__ == "__main__":

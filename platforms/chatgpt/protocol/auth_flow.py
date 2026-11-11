@@ -19,7 +19,7 @@ import secrets
 import subprocess
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Any
 from urllib.parse import urlparse, parse_qs, parse_qsl, urljoin, urlencode, urlunparse
 
@@ -40,6 +40,13 @@ from platforms.chatgpt.protocol.totp import totp_now as _totp_now
 logger = logging.getLogger(__name__)
 
 
+class PhoneVerificationRequiredError(RuntimeError):
+    """Web-only 遇到手机挑战必须失败，不能把已有会话当成注册成功。"""
+
+    def __init__(self):
+        super().__init__("Web-only 注册遇到 phone challenge：服务端要求手机验证，本次失败（不接码、不绕过）")
+
+
 class AuthResult:
     """认证结果"""
 
@@ -57,6 +64,8 @@ class AuthResult:
         # 手机号注册链路专用：账号身份是手机号，邮箱是后来绑上去的（可能没绑上）
         self.phone_number: str = ""
         self.bound_email: str = ""
+        # 备注：仅在 phone-otp/validate 通过后写入，区分“租到号码”和“真正接码成功”。
+        self.sms_verification: dict = {}
 
     def is_valid(self) -> bool:
         return bool(self.session_token and self.access_token)
@@ -75,6 +84,7 @@ class AuthResult:
             "totp_secret": self.totp_secret,
             "phone_number": self.phone_number,
             "bound_email": self.bound_email,
+            "sms_verification": self.sms_verification
         }
 
 
@@ -124,6 +134,8 @@ class AuthFlow(PhoneRegisterMixin):
         # 可选 SMS 接码控制器（sms_provider.PhoneCallbackController 实例）
         # 命中 add-phone 时自动租手机号 + 接 SMS 验证码，否则回退到环境变量路径
         self._sms_callback = sms_callback
+        # 不在兜底/重试时重置：即使异常被上层吞掉，也不能抢救成 Web-only 成功。
+        self._phone_verification_required = False
         # 密码一在 OpenAI 侧生效就回调出去，调用方负责立刻落盘。
         # 签名 (email: str, password: str) -> None，异常由 register_password 吞掉。
         # ⚠️ 协议层不认识 webui.db，所以只给回调，"存哪"留给调用方决定，
@@ -887,6 +899,36 @@ class AuthFlow(PhoneRegisterMixin):
         cu = (continue_url or "").strip().lower()
         return (pt == "add_phone") or ("add-phone" in cu)
 
+    def _guard_phone_verification(self, page_type: str = "", continue_url: str = "") -> None:
+        """只拒绝显式禁用手机验证的流程；旧模式继续走原来的接码分支。"""
+        pt = (page_type or "").strip().lower()
+        cu = (continue_url or "").strip().lower()
+        if (
+            self._is_add_phone_state(page_type, continue_url)
+            or pt in {
+                "phone_otp_verification",
+                "phone_verification",
+                "phone_verification_required",
+                "phone_challenge",
+                "add_phone_verification",
+                "phone_otp_send",
+                "contact_verification",
+            }
+            or "/phone-verification" in cu
+            or "/phone-otp" in cu
+            or "/contact-verification" in cu
+        ):
+            self._phone_verification_required = True
+        if getattr(self, "_phone_verification_required", False) and self._env_flag(
+            "OPENAI_DISABLE_PHONE_VERIFICATION", "0"
+        ):
+            raise PhoneVerificationRequiredError()
+
+    def _guard_phone_step(self, step: dict | None) -> None:
+        self._guard_phone_verification(
+            self._extract_page_type(step), self._extract_continue_url_from_step(step)
+        )
+
     @staticmethod
     def _is_mfa_challenge_state(page_type: str = "", continue_url: str = "") -> bool:
         """判断是否进入 mfa-challenge 状态（已有账号启用 2FA，密码验证后需要 TOTP 码）。"""
@@ -984,6 +1026,7 @@ class AuthFlow(PhoneRegisterMixin):
         - 优先使用 self._sms_callback（SMS 接码 controller，自动租号 + 接码）
         - 回退到环境变量路径：OPENAI_PHONE_NUMBER + OPENAI_PHONE_OTP_CMD/OPENAI_PHONE_OTP
         """
+        self._guard_phone_verification(page_type="add_phone", continue_url=continue_url)
         if self._sms_callback is not None:
             try:
                 return self._handle_add_phone_via_sms(continue_url)
@@ -1002,6 +1045,7 @@ class AuthFlow(PhoneRegisterMixin):
         单号窗口 80s，窗口内只轮询接码平台收码；失败自动 cancel + 换新号。
         最多换号次数默认 3，主人可在 WebUI / 环境变量 OPENAI_PHONE_MAX_ATTEMPTS 自定义。
         """
+        self._guard_phone_verification(page_type="add_phone", continue_url=continue_url)
         ctrl = self._sms_callback
 
         # 用 try/finally 保证即使 for 循环抛异常，也能 release lock + 最后一次 cleanup
@@ -1094,6 +1138,13 @@ class AuthFlow(PhoneRegisterMixin):
             except Exception as e:
                 last_err = e
                 logger.warning("[sms] 第 %d 个号租号失败: %s", phone_attempt, e)
+                # 余额不足/密钥无效是平台级错误，继续换号只会白烧请求。
+                if type(e).__name__ == "SmsProviderFatalError" or any(
+                    token in str(e).upper()
+                    for token in ("NO_BALANCE", "BAD_KEY", "INVALID_KEY", "NO_KEY", "WRONG_KEY")
+                ):
+                    logger.warning("[sms] 接码平台级错误（余额或密钥），停止继续换号")
+                    break
                 continue
             if not phone:
                 last_err = RuntimeError("SMS 接码 controller 未返回手机号")
@@ -1199,6 +1250,13 @@ class AuthFlow(PhoneRegisterMixin):
                     logger.info("[sms] ✅ phone-otp/validate 通过 (phone=%s code=%s) next=%s",
                                 phone, code, (next_url or "")[:160])
                     ctrl.report_success()
+                    activation = getattr(ctrl, "activation", None)
+                    self.result.sms_verification = {
+                        "used": True,
+                        "verified": True,
+                        "country": str(getattr(activation, "country", "") or ""),
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }
                     return next_url or continue_url or ""
                 except Exception as e:
                     last_err = e
@@ -1228,6 +1286,7 @@ class AuthFlow(PhoneRegisterMixin):
           - OPENAI_PHONE_NUMBER=+1...
           - OPENAI_PHONE_OTP_CMD='...返回短信内容...' 或 OPENAI_PHONE_OTP=123456
         """
+        self._guard_phone_verification(page_type="add_phone", continue_url=continue_url)
         phone_raw = self._get_env("OPENAI_PHONE_NUMBER", "").strip()
         phone_candidates = [x.strip() for x in phone_raw.split(",") if x.strip()]
         if not phone_candidates:
@@ -1822,6 +1881,7 @@ class AuthFlow(PhoneRegisterMixin):
         # 带 login_hint 时服务端会直接把人放到对应的页面（手机号注册就是
         # /create-account/password），落点决定了下一步还要不要提交身份。
         self._last_auth_landing_url = str(getattr(resp, "url", "") or "")
+        self._guard_phone_verification(continue_url=self._last_auth_landing_url)
 
         # 从 cookie 获取 oai-did
         device_id = ""
@@ -1962,6 +2022,7 @@ class AuthFlow(PhoneRegisterMixin):
             trace_step="authorize_continue_signup",
         )
 
+        self._guard_phone_step(data)
         # 检测 page_type/continue_url，区分新账号与已有账号
         try:
             page = (data.get("page") or {}) if isinstance(data, dict) else {}
@@ -2278,9 +2339,11 @@ class AuthFlow(PhoneRegisterMixin):
         if resp.status_code != 200:
             raise RuntimeError(f"密码登录失败: {resp.status_code} - {describe_error(resp.text)}")
         try:
-            return resp.json()
+            data = resp.json()
         except Exception:
-            return {}
+            data = {}
+        self._guard_phone_step(data)
+        return data
 
     # ── Step 7.5: 提交 TOTP 2FA 验证码 ──
     def submit_mfa_totp(self, totp_code: str, challenge_id: str) -> dict:
@@ -2310,9 +2373,11 @@ class AuthFlow(PhoneRegisterMixin):
         if resp.status_code != 200:
             raise RuntimeError(f"TOTP 验证失败: {resp.status_code} - {describe_error(resp.text)}")
         try:
-            return resp.json()
+            data = resp.json()
         except Exception:
-            return {}
+            data = {}
+        self._guard_phone_step(data)
+        return data
 
     # ── Step 8: 验证 OTP ──
     def verify_otp(self, otp_code: str) -> dict:
@@ -2330,9 +2395,11 @@ class AuthFlow(PhoneRegisterMixin):
             raise RuntimeError(f"OTP 验证失败: {resp.status_code} - {describe_error(resp.text)}")
         logger.info("OTP 验证成功")
         try:
-            return resp.json()
+            data = resp.json()
         except Exception:
-            return {}
+            data = {}
+        self._guard_phone_step(data)
+        return data
 
     # ── Step 9: 创建账户 ──
     def create_account(self) -> str:
@@ -2376,6 +2443,7 @@ class AuthFlow(PhoneRegisterMixin):
             logger.error("创建账户失败: http=%s %s", resp.status_code, reason)
             raise RuntimeError(f"创建账户失败: {resp.status_code} - {reason}")
         data = resp.json()
+        self._guard_phone_step(data)
         continue_url = data.get("continue_url", "")
 
         # 尝试 workspace select
@@ -2516,6 +2584,7 @@ class AuthFlow(PhoneRegisterMixin):
         1) 相对路径 -> 绝对路径
         2) workspace 页面 -> 调用 workspace/select 取下一跳
         """
+        self._guard_phone_verification(continue_url=continue_url)
         if not continue_url:
             return ""
         out = continue_url.strip()
@@ -2528,6 +2597,7 @@ class AuthFlow(PhoneRegisterMixin):
                 next_url = self._workspace_select(workspace_id)
                 if next_url:
                     out = next_url
+        self._guard_phone_verification(continue_url=out)
         return out
 
     @staticmethod
@@ -2561,6 +2631,7 @@ class AuthFlow(PhoneRegisterMixin):
         referer = "https://auth.openai.com/"
 
         for i in range(max_hops):
+            self._guard_phone_verification(continue_url=current_url)
             # 逐跳整页导航，头必须像浏览器：同 auth_oauth_init，旧版只发
             # Accept/Referer/UA，缺 client hints 和 Sec-Fetch-*（实测那正是
             # 409 invalid_state 的来源，见 auth_oauth_init docstring）。
@@ -2580,6 +2651,8 @@ class AuthFlow(PhoneRegisterMixin):
                 current_url, headers=headers, timeout=30, allow_redirects=False
             )
             self._trace_http(f"redirect_hop_{i+1}", resp)
+            self._guard_phone_verification(continue_url=str(getattr(resp, "url", "") or ""))
+            self._guard_phone_verification(continue_url=resp.headers.get("Location", ""))
             referer = current_url
 
             if "/api/auth/callback/openai" in current_url:
@@ -2615,6 +2688,7 @@ class AuthFlow(PhoneRegisterMixin):
             else:
                 break
 
+        self._guard_phone_verification(continue_url=current_url)
         # 补一跳首页
         if (not callback_url) and (not current_url.rstrip("/").endswith("chatgpt.com")):
             self.session.get(
@@ -2629,6 +2703,7 @@ class AuthFlow(PhoneRegisterMixin):
     def _reauthorize_for_session(self, original_auth_url: str) -> str | None:
         """已有账号 OTP 验证后，重新发起 authorize 获取 callback URL"""
         logger.info("[9.5/10] 重新 authorize 获取 session ...")
+        self._guard_phone_verification()
         try:
             # 去掉 prompt=login 参数，利用已有的 auth session cookie
             from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -2645,6 +2720,8 @@ class AuthFlow(PhoneRegisterMixin):
                 timeout=15,
             )
             self._trace_http("reauthorize_start", resp)
+            self._guard_phone_verification(continue_url=str(getattr(resp, "url", "") or ""))
+            self._guard_phone_verification(continue_url=resp.headers.get("Location", ""))
             logger.info(f"reauthorize status={resp.status_code}")
 
             # 跟随 redirect chain 找到 callback URL
@@ -2663,7 +2740,9 @@ class AuthFlow(PhoneRegisterMixin):
                             timeout=15,
                         )
                         self._trace_http(f"reauthorize_hop_{hop+1}", hop_resp)
+                        self._guard_phone_verification(continue_url=str(getattr(hop_resp, "url", "") or ""))
                         next_loc = hop_resp.headers.get("Location", "")
+                        self._guard_phone_verification(continue_url=next_loc)
                         if hop_resp.status_code not in (301, 302, 303, 307, 308) or not next_loc:
                             # 检查最终 URL
                             final_url = str(getattr(hop_resp, 'url', current_url))
@@ -2722,6 +2801,7 @@ class AuthFlow(PhoneRegisterMixin):
           3. 兼容大小写 / 下划线变体
         access_token 取 JSON 响应里的 `accessToken`。
         """
+        self._guard_phone_verification()
         first_call = not getattr(self, "_auth_session_fetched", False)
         self._auth_session_fetched = True
         if first_call:
@@ -2769,11 +2849,13 @@ class AuthFlow(PhoneRegisterMixin):
         在拿不到 session_token 时主动消费一次 callback：跟随到 chatgpt.com 主页，
         服务器会 Set-Cookie session-token。
         """
+        self._guard_phone_verification()
         if not callback_url or "code=" not in callback_url:
             return False
         try:
             current = callback_url
             for hop in range(8):
+                self._guard_phone_verification(continue_url=current)
                 resp = self.session.get(
                     current,
                     headers={
@@ -2785,6 +2867,8 @@ class AuthFlow(PhoneRegisterMixin):
                     allow_redirects=False,
                 )
                 self._trace_http(f"consume_callback_hop_{hop+1}", resp)
+                self._guard_phone_verification(continue_url=str(getattr(resp, "url", "") or ""))
+                self._guard_phone_verification(continue_url=resp.headers.get("Location", ""))
                 if resp.status_code not in (301, 302, 303, 307, 308):
                     break
                 loc = (resp.headers.get("Location", "") or "").strip()
@@ -2905,7 +2989,8 @@ class AuthFlow(PhoneRegisterMixin):
                 issued_after=otp_sent_at,
             )
             try:
-                self.verify_otp(otp_code)
+                otp_resp = self.verify_otp(otp_code)
+                self._guard_phone_step(otp_resp)
                 self.fetch_client_auth_session_dump("post_verify_otp_new")
             except RuntimeError as e:
                 # 偶发 401 错码，补发一次 OTP 并重试
@@ -2919,7 +3004,8 @@ class AuthFlow(PhoneRegisterMixin):
                         timeout=otp_timeout,
                         issued_after=otp_sent_at,
                     )
-                    self.verify_otp(otp_code)
+                    otp_resp = self.verify_otp(otp_code)
+                    self._guard_phone_step(otp_resp)
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_new")
                 else:
                     raise
@@ -2954,6 +3040,7 @@ class AuthFlow(PhoneRegisterMixin):
                 else:
                     logger.info("该号无已知密码，用默认规则猜一个试试（多半 401）")
                 login_resp = self.login_password_verify(login_password)
+                self._guard_phone_step(login_resp)
                 login_page_type = self._extract_page_type(login_resp)
                 continue_url = self._normalize_continue_url(
                     (login_resp or {}).get("continue_url", "") if isinstance(login_resp, dict) else ""
@@ -2997,6 +3084,7 @@ class AuthFlow(PhoneRegisterMixin):
                         issued_after=otp_sent_at,
                     )
                     otp_resp = self.verify_otp(otp_code)
+                    self._guard_phone_step(otp_resp)
                     continue_url = self._normalize_continue_url(
                         (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
                     )
@@ -3075,6 +3163,7 @@ class AuthFlow(PhoneRegisterMixin):
                         self.fetch_client_auth_session_dump("post_verify_otp_retry_existing")
                     else:
                         raise
+                self._guard_phone_step(otp_resp)
                 continue_url = (otp_resp or {}).get("continue_url", "") if isinstance(otp_resp, dict) else ""
                 continue_url = self._normalize_continue_url(continue_url)
                 if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
@@ -3164,6 +3253,7 @@ class AuthFlow(PhoneRegisterMixin):
         elif not self.result.is_valid():
             raise RuntimeError("注册完成但未获取有效凭证")
 
+        self._guard_phone_verification()
         logger.info("注册流程完成!")
         return self.result
 

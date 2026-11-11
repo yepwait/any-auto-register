@@ -115,11 +115,17 @@ class BackfillResult:
     cookie_header: str = ""
     error_message: str = ""
     attempts: list[BackfillAttempt] = field(default_factory=list)
+    sms_verification: dict = field(default_factory=dict)
+    # OpenAI 明说这号已被删除/停用时为 True。调用方据此把账号单独归档，
+    # 而不是继续当成"补 RT 失败"反复重试。
+    account_deleted: bool = False
 
     def summary(self) -> str:
         if self.success:
             label = "复用会话" if self.strategy == STRATEGY_SESSION else "协议重登"
             return f"补 RT 成功（{label}）"
+        if self.account_deleted:
+            return f"账号已被删除或停用（{self.error_message or '补 RT 失败'}）"
         return self.error_message or "补 RT 失败"
 
 
@@ -141,6 +147,7 @@ class RefreshTokenBackfiller:
         mail_unavailable_reason: str = "",
         allow_login: bool = True,
         log_fn: Optional[Callable[[str], None]] = None,
+        task_control: Optional[object] = None,
     ):
         self.email = (email or "").strip()
         self.password = (password or "").strip()
@@ -153,6 +160,7 @@ class RefreshTokenBackfiller:
         self.mail_provider = mail_provider
         self.mail_unavailable_reason = mail_unavailable_reason
         self.allow_login = allow_login
+        self.task_control = task_control
         self._log_fn = log_fn
         self.log = log_fn or logger.info
         # 当前正在跑的 flow，报错后还要从它身上把已到手的凭证捞回来
@@ -197,6 +205,13 @@ class RefreshTokenBackfiller:
             if result.refresh_token:
                 result.success = True
                 result.strategy = strategy
+                # RT 已在链路中段取得；若末段报的是“账号已删除/停用”，停用信号
+                # 优先于成功，不能让一个死号因为手握 RT 继续留在可用库存里。
+                if failure:
+                    from services.chatgpt_account_state import is_account_deactivated_message
+
+                    if is_account_deactivated_message("", failure):
+                        result.account_deleted = True
                 note = f"末段报错但 RT 已到手：{failure}" if failure else "拿到 refresh_token"
                 result.attempts.append(BackfillAttempt(strategy, True, note))
                 self.log(f"[补RT] {self._label(strategy)}成功: {self.email}")
@@ -207,6 +222,7 @@ class RefreshTokenBackfiller:
             result.attempts.append(BackfillAttempt(strategy, False, message))
 
         result.error_message = self._compose_error(result)
+        result.account_deleted = self._looks_deleted(result)
         return result
 
     # ── 策略一：复用已有会话 ──
@@ -258,10 +274,13 @@ class RefreshTokenBackfiller:
             settings,
             log_fn=lambda message: self.log(f"[补RT][接码] {message}"),
             proxy=self.proxy,
+            task_control=self.task_control,
         )
 
     def _env_overrides(self, overrides: dict) -> dict:
         merged = dict(overrides)
+        if str(self.extra_config.get("chatgpt_require_sms_verified", "")).lower() in {"1", "true"}:
+            merged["OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY"] = "0"
         merged["OTP_TIMEOUT"] = str(self._otp_timeout())
         for config_key, env_key in (
             ("sms_per_phone_timeout", "OPENAI_PHONE_OTP_TIMEOUT"),
@@ -307,6 +326,9 @@ class RefreshTokenBackfiller:
             value = str(getattr(auth, attr, "") or "").strip()
             if value:
                 setattr(result, attr, value)
+        # 备注：结构化审计字段保持字典类型，避免落库后前端无法识别。
+        if isinstance(getattr(auth, "sms_verification", None), dict) and auth.sms_verification:
+            result.sms_verification = dict(auth.sms_verification)
 
     def _compose_error(self, result: BackfillResult) -> str:
         details = "；".join(
@@ -315,6 +337,20 @@ class RefreshTokenBackfiller:
             if not item.ok
         )
         return f"补 RT 失败（{details}）" if details else "补 RT 失败"
+
+    def _looks_deleted(self, result: BackfillResult) -> bool:
+        """失败原因里读到"账号已被删除/停用"才算数。
+
+        协议重登/OTP 那步撞 403 时，OpenAI 会原样说
+        ``You do not have an account because it has been deleted or deactivated``，
+        这段话被 describe_error 摘进异常文本，这里只做一次子串判定；其余失败
+        （会话失效、密码错、收不到码）一律不算，免得误杀。
+        """
+        from services.chatgpt_account_state import is_account_deactivated_message
+
+        texts = [item.message for item in result.attempts]
+        texts.append(result.error_message)
+        return any(is_account_deactivated_message("", text) for text in texts)
 
     @staticmethod
     def _label(strategy: str) -> str:

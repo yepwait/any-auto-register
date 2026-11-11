@@ -332,6 +332,7 @@ def create_mailbox(
             proxy=proxy,
         )
     elif provider in {"outlook", "microsoft"}:
+        # 备注：微软 OAuth/Graph/IMAP 走服务器直连；注册代理可能拒绝微软域名的 CONNECT。
         return OutlookMailbox(
             imap_server=extra.get("outlook_imap_server", ""),
             imap_port=extra.get("outlook_imap_port", ""),
@@ -339,7 +340,7 @@ def create_mailbox(
             backend=extra.get("outlook_backend", ""),
             graph_api_base=extra.get("outlook_graph_api_base", ""),
             mail_import_source=extra.get("mail_import_source", ""),
-            proxy=proxy,
+            proxy=None,
         )
     else:  # laoudo
         return LaoudoMailbox(
@@ -3116,15 +3117,11 @@ class OutlookMailboxBackend(ABC):
 class OutlookImapMailboxBackend(OutlookMailboxBackend):
     backend_name = "imap"
 
-    def _select_folder(self, imap_conn, folder: str):
-        """Prefer read-only selection, then fall back to SELECT for Outlook IMAP."""
-        try:
-            return imap_conn.select(folder, readonly=True)
-        except Exception as exc:
-            self.mailbox._log(
-                f"[微软邮箱][IMAP] folder={folder} EXAMINE 失败，改用 SELECT: {exc}"
-            )
-            return imap_conn.select(folder, readonly=False)
+    @staticmethod
+    def _select_folder(imap_conn, folder: str):
+        # 备注：imaplib 不会替带空格的邮箱目录补引号，Outlook 会直接返回 BAD。
+        escaped = str(folder or "").replace("\\", "\\\\").replace('"', '\\"')
+        return imap_conn.select(f'"{escaped}"', readonly=True)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         imap_conn = None
@@ -3134,15 +3131,16 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
             for folder in self.mailbox._imap_folder_names:
                 try:
                     status, _ = self._select_folder(imap_conn, folder)
+                    if status != "OK":
+                        continue
+                    status, data = imap_conn.uid("search", None, "ALL")
+                    if status != "OK":
+                        continue
                 except Exception as exc:
+                    # 备注：单个目录不可用时保留其他目录的基线，不能把已收集 ID 全丢掉。
                     self.mailbox._log(
-                        f"[微软邮箱][IMAP] folder={folder} select 失败，跳过: {exc}"
+                        f"[微软邮箱][IMAP] folder={folder} 基线读取失败: {exc}"
                     )
-                    continue
-                if status != "OK":
-                    continue
-                status, data = imap_conn.uid("search", None, "ALL")
-                if status != "OK":
                     continue
                 ids = data[0].split() if data and data[0] else []
                 for uid in ids[-100:]:
@@ -3173,6 +3171,7 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
         from email import message_from_bytes
         from email.utils import parsedate_to_datetime
         from email.policy import default as email_default_policy
+        from email.utils import parsedate_to_datetime
 
         seen = {str(mid) for mid in (before_ids or set())}
         exclude_codes = {
@@ -3186,6 +3185,8 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
         except (TypeError, ValueError):
             otp_cutoff = None
         keyword_lower = str(keyword or "").strip().lower()
+        otp_sent_at = kwargs.get("otp_sent_at")
+        otp_cutoff = float(otp_sent_at) - 5 if otp_sent_at else None
 
         def poll_once() -> Optional[str]:
             for folder in self.mailbox._imap_folder_names:
@@ -3244,16 +3245,16 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
                         msg = message_from_bytes(raw, policy=email_default_policy)
                         subject = self.mailbox._decode_header_value(msg.get("Subject", ""))
                         text = self.mailbox._extract_message_text(msg)
-                        if otp_cutoff:
+                        message_date = str(msg.get("Date", "") or "").strip()
+                        if otp_cutoff and message_date:
                             try:
-                                message_ts = parsedate_to_datetime(
-                                    msg.get("Date", "") or ""
-                                ).timestamp()
+                                message_ts = parsedate_to_datetime(message_date).timestamp()
                             except (TypeError, ValueError, OverflowError):
-                                message_ts = 0
-                            if message_ts and message_ts < otp_cutoff:
+                                message_ts = None
+                            if message_ts is not None and message_ts < otp_cutoff:
+                                # 备注：基线读取失败时仍按发码时间挡住历史验证码。
                                 self.mailbox._log(
-                                    f"[微软邮箱][IMAP] folder={folder} 跳过发码前旧邮件: uid={uid_str}"
+                                    f"[微软邮箱][IMAP] folder={folder} 跳过旧邮件 subject={subject or '-'}"
                                 )
                                 continue
                         self.mailbox._log(
@@ -3829,7 +3830,8 @@ class OutlookMailbox(BaseMailbox):
             f"account_type={account_type} "
             f"auth_mode={auth_mode}"
         )
-        return MailboxAccount(
+        # 备注：保留本次领取的凭据快照，注册成功后写入账号 extra，补 RT 才能继续收验证码。
+        mailbox_account = MailboxAccount(
             email=email,
             account_id=str(payload.get("id") or ""),
             extra={
@@ -3842,6 +3844,8 @@ class OutlookMailbox(BaseMailbox):
                 "outlook_backend": self._backend_name,
             },
         )
+        self._last_account = mailbox_account
+        return mailbox_account
 
     def requeue_account(self, account: MailboxAccount) -> None:
         from sqlmodel import Session, select
@@ -4199,11 +4203,13 @@ class OutlookMailbox(BaseMailbox):
                 preferred_backend="imap",
             )
 
-        last_error = None
+        # 备注：保留每个端点和认证方式的真实异常，避免线上只看到“登录失败: None”。
+        errors: list[str] = []
         for host in self._imap_servers:
             if not host:
                 continue
             if access_token:
+                imap_conn = None
                 try:
                     imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
                     self._imap_auth_oauth(
@@ -4211,24 +4217,31 @@ class OutlookMailbox(BaseMailbox):
                     )
                     return imap_conn
                 except Exception as exc:
-                    last_error = exc
+                    errors.append(f"{host}:oauth:{type(exc).__name__}: {exc!s}".strip())
                     try:
-                        imap_conn.logout()
+                        if imap_conn:
+                            imap_conn.logout()
                     except Exception:
                         pass
             if password:
+                imap_conn = None
                 try:
                     imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
                     imap_conn.login(email_addr, password)
                     return imap_conn
                 except Exception as exc:
-                    last_error = exc
+                    errors.append(f"{host}:password:{type(exc).__name__}: {exc!s}".strip())
                     try:
-                        imap_conn.logout()
+                        if imap_conn:
+                            imap_conn.logout()
                     except Exception:
                         pass
 
-        raise RuntimeError(f"微软邮箱 IMAP 登录失败: {last_error}")
+        if not errors:
+            reason = "未提供 OAuth token 或邮箱密码"
+        else:
+            reason = " | ".join(errors[-6:])
+        raise RuntimeError(f"微软邮箱 IMAP 登录失败: {reason}")
 
     def _resolve_backend(self, account: MailboxAccount) -> OutlookMailboxBackend:
         extra = account.extra if isinstance(account.extra, dict) else {}
@@ -4243,6 +4256,25 @@ class OutlookMailbox(BaseMailbox):
                 str(extra.get("client_id") or "").strip()
                 and str(extra.get("refresh_token") or "").strip()
             )
+            if has_oauth:
+                try:
+                    graph_token = self._get_oauth_access_token(
+                        account,
+                        preferred_backend="graph",
+                    )
+                    graph_cache = (extra.get("_oauth_token_cache") or {}).get("graph")
+                    scope_label = str((graph_cache or {}).get("scope_label") or "").strip()
+                    # 中文备注：微软可能只返回 IMAP scope；这类 token 不是 JWT，不能拿去请求 Graph。
+                    if scope_label and scope_label != "graph_default":
+                        # 中文备注：只有明确拿到非 Graph scope 时才降级，兼容测试/代理返回的占位 token。
+                        self._log(
+                            "[微软邮箱] OAuth token 为 IMAP scope，自动切换 IMAP XOAUTH2"
+                        )
+                        override = "imap"
+                except Exception as exc:
+                    # 中文备注：Graph token 获取失败时交给 IMAP 后端重试，避免把错误吞成“没有邮件”。
+                    self._log(f"[微软邮箱] Graph token 获取失败，自动切换 IMAP: {exc}")
+                    override = "imap"
             if not has_oauth:
                 self._log(
                     "[微软邮箱] Graph 后端需要 OAuth 凭据，当前账号缺少 client_id/refresh_token，自动切换 IMAP"

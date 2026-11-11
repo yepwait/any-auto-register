@@ -28,6 +28,7 @@ from platforms.chatgpt.registration_engine import (
     REGISTRATION_MODE_REFRESH_TOKEN,
     ChatGPTRegistrationEngine,
     RegistrationResult,
+    is_chatgpt_web_only,
 )
 
 CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN = REGISTRATION_MODE_REFRESH_TOKEN
@@ -71,6 +72,8 @@ def normalize_chatgpt_registration_mode(value) -> str:
 
 def resolve_chatgpt_registration_mode(extra: Optional[dict]) -> str:
     extra = extra or {}
+    if is_chatgpt_web_only(extra):
+        return CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY
     if "chatgpt_registration_mode" in extra:
         return normalize_chatgpt_registration_mode(extra.get("chatgpt_registration_mode"))
     if "chatgpt_has_refresh_token_solution" in extra:
@@ -98,6 +101,8 @@ def normalize_chatgpt_register_flow(value) -> str:
 
 def resolve_chatgpt_register_flow(extra: Optional[dict]) -> str:
     extra = extra or {}
+    if is_chatgpt_web_only(extra):
+        return CHATGPT_REGISTER_FLOW_EMAIL
     return normalize_chatgpt_register_flow(extra.get("chatgpt_register_flow"))
 
 
@@ -107,6 +112,8 @@ def resolve_chatgpt_bind_2fa(extra: Optional[dict]) -> bool:
     默认关：绑上之后这个号的每次登录都要动态码，密钥又只下发一次，丢了就再也
     登不进去。愿意承担这个代价的人自己在任务里勾。
     """
+    if is_chatgpt_web_only(extra):
+        return False
     value = (extra or {}).get("chatgpt_bind_2fa")
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -132,21 +139,33 @@ class ChatGPTRegistrationModeAdapter:
         mode: str,
         register_flow: str = DEFAULT_CHATGPT_REGISTER_FLOW,
         bind_2fa: bool = False,
+        web_only: bool = False,
     ):
-        self.mode = mode
-        self.register_flow = register_flow
-        self.bind_2fa = bind_2fa
+        self.web_only = web_only
+        self.mode = CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY if web_only else mode
+        self.register_flow = CHATGPT_REGISTER_FLOW_EMAIL if web_only else register_flow
+        self.bind_2fa = False if web_only else bind_2fa
 
     def run(self, context: ChatGPTRegistrationContext) -> RegistrationResult:
+        if is_chatgpt_web_only(context.extra_config):
+            self.web_only = True
+            self.mode = CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY
+            self.register_flow = CHATGPT_REGISTER_FLOW_EMAIL
+            self.bind_2fa = False
+        extra_config = dict(context.extra_config)
+        if self.web_only:
+            extra_config["chatgpt_web_only"] = "1"
+        # Web 池由外层预算调度补号，内部重试会额外消耗邮箱并超出预算。
+        max_attempts = 1 if self.web_only else _MAX_ATTEMPTS
         result: Optional[RegistrationResult] = None
-        for attempt in range(_MAX_ATTEMPTS):
+        for attempt in range(max_attempts):
             engine = ChatGPTRegistrationEngine(
                 mailbox=context.mailbox,
                 mode=self.mode,
                 proxy=context.proxy_url,
                 email=context.email or "",
                 password=context.password or "",
-                extra_config=context.extra_config,
+                extra_config=extra_config,
                 log_fn=context.callback_logger,
                 mailbox_kind=context.mailbox_kind,
                 register_flow=self.register_flow,
@@ -158,11 +177,11 @@ class ChatGPTRegistrationModeAdapter:
 
             error = str(result.error_message or "").lower()
             marker = next((m for m in _MAILBOX_ERROR_MARKERS if m in error), None)
-            if marker is None or attempt >= _MAX_ATTEMPTS - 1:
+            if marker is None or attempt >= max_attempts - 1:
                 break
             context.callback_logger(
                 f"邮箱链路失效（{marker}），换用下一个邮箱重试 "
-                f"({attempt + 1}/{_MAX_ATTEMPTS - 1})…"
+                f"({attempt + 1}/{max_attempts - 1})…"
             )
         return result
 
@@ -178,6 +197,14 @@ class ChatGPTRegistrationModeAdapter:
         )
 
     def _build_account_extra(self, result: RegistrationResult) -> dict:
+        metadata = dict(result.metadata or {})
+        if self.web_only:
+            # 这些 metadata 字段来自邮箱池，不能覆盖真正的 ChatGPT 凭据。
+            # 旧模式的字段布局保持不变。
+            for key in ("refresh_token", "client_id", "password"):
+                value = metadata.pop(key, None)
+                if value not in (None, "", False):
+                    metadata.setdefault(f"outlook_{key}", value)
         return {
             "access_token": result.access_token,
             "refresh_token": result.refresh_token,
@@ -190,7 +217,7 @@ class ChatGPTRegistrationModeAdapter:
             "chatgpt_register_flow": self.register_flow,
             "chatgpt_bind_2fa": self.bind_2fa,
             "chatgpt_token_source": result.source,
-            **{k: v for k, v in (result.metadata or {}).items() if v not in (None, "", False)},
+            **{k: v for k, v in metadata.items() if v not in (None, "", False)},
         }
 
 
@@ -201,4 +228,5 @@ def build_chatgpt_registration_mode_adapter(
         resolve_chatgpt_registration_mode(extra),
         resolve_chatgpt_register_flow(extra),
         resolve_chatgpt_bind_2fa(extra),
+        web_only=is_chatgpt_web_only(extra),
     )

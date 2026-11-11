@@ -131,6 +131,17 @@ def record_cliproxy_sync_result(extra: dict[str, Any], sync_result: dict[str, An
     return sync_statuses[CLIPROXY_SYNC_NAME]
 
 
+def _pick_account_value(account: Any, extra: dict[str, Any], *keys: str, default: str = "") -> str:
+    for key in keys:
+        value = extra.get(key)
+        if value:
+            return str(value).strip()
+        value = getattr(account, key, "")
+        if value:
+            return str(value).strip()
+    return default
+
+
 def build_chatgpt_sync_account(account: Any):
     extra = _get_account_extra(account)
 
@@ -140,12 +151,14 @@ def build_chatgpt_sync_account(account: Any):
     obj = _SyncAccount()
     obj.email = getattr(account, "email", "")
     obj.user_id = getattr(account, "user_id", "")
-    obj.access_token = extra.get("access_token") or getattr(account, "token", "")
-    obj.refresh_token = extra.get("refresh_token", "")
-    obj.id_token = extra.get("id_token", "")
-    obj.session_token = extra.get("session_token", "")
-    obj.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
-    obj.cookies = extra.get("cookies", "")
+    obj.access_token = _pick_account_value(account, extra, "access_token", "accessToken", "token")
+    obj.refresh_token = _pick_account_value(account, extra, "refresh_token", "refreshToken")
+    obj.id_token = _pick_account_value(account, extra, "id_token", "idToken")
+    obj.session_token = _pick_account_value(account, extra, "session_token", "sessionToken")
+    obj.client_id = _pick_account_value(
+        account, extra, "client_id", "clientId", default="app_EMoamEEZ73f0CkXaXp7hrann"
+    )
+    obj.cookies = _pick_account_value(account, extra, "cookies")
     return obj
 
 
@@ -220,13 +233,59 @@ def update_account_model_cliproxy_sync(
     return state
 
 
+def _merge_account_credentials(target: AccountModel, source: Any) -> None:
+    """把探测/刷新快照里的最新凭证合并到数据库账号。
+
+    ``status_probe`` 会在本次请求里就地更新 duck-typed 快照；如果只保存
+    ``chatgpt_local`` 状态，轮换后的 AT/RT 会在下一次从数据库读取时丢失。
+    这里只写非空值，并同时兼容历史账号常见的 camelCase 字段。
+    """
+    source_extra = _get_account_extra(source)
+    target_extra = target.get_extra()
+    for canonical, keys in (
+        ("access_token", ("access_token", "accessToken", "token")),
+        ("refresh_token", ("refresh_token", "refreshToken")),
+        ("id_token", ("id_token", "idToken")),
+        ("session_token", ("session_token", "sessionToken")),
+        ("client_id", ("client_id", "clientId")),
+        ("cookies", ("cookies",)),
+    ):
+        value = _pick_account_value(source, source_extra, *keys)
+        if value:
+            target_extra[canonical] = value
+            if canonical == "access_token":
+                target.token = value
+    target.set_extra(target_extra)
+
+
+def merge_account_credentials(account_id: int, source: Any) -> None:
+    """把探测过程中轮换到内存快照里的凭证单独落库。
+
+    用于“刷新成功、但随后测活抛异常”的场景：异常会跳出正常保存路径，若不单独
+    提交，新 AT/RT 就丢了。只写非空值，不碰探测状态。
+    """
+    if source is None:
+        return
+    with Session(engine) as session:
+        row = session.get(AccountModel, account_id)
+        if row is None:
+            return
+        _merge_account_credentials(row, source)
+        session.add(row)
+        session.commit()
+
+
 def update_account_model_local_probe(
     account: AccountModel,
     probe: dict[str, Any],
     session: Session | None = None,
     commit: bool = True,
+    credential_source: Any | None = None,
 ) -> dict[str, Any]:
     extra = account.get_extra()
+    if credential_source is not None:
+        _merge_account_credentials(account, credential_source)
+        extra = account.get_extra()
     extra["chatgpt_local"] = probe
     account.set_extra(extra)
     apply_chatgpt_status_policy(account, local_probe=probe)

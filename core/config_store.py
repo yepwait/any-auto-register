@@ -125,13 +125,14 @@ class ConfigStore:
     """简单 key-value 配置存储"""
 
     def get(self, key: str, default: str = "") -> str:
-        env_values = _runtime_env_values()
         with Session(engine) as s:
             item = s.get(ConfigItem, key)
             value = str(item.value if item else "" or "").strip()
             if value:
                 return value
-        fallback = _get_env_fallback_value(key, env_values=env_values)
+        # Most values are stored in SQLite: do not parse .env or copy the whole
+        # process environment on every successful database hit.
+        fallback = _get_env_fallback_value(key)
         return fallback or default
 
     def set(self, key: str, value: str) -> None:

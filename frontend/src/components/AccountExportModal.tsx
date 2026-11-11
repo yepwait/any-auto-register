@@ -10,6 +10,7 @@ export type AccountExportFilters = {
   email?: string
   status?: string
   plus_status?: string
+  sms_verified?: string
   created_at_start?: string
   created_at_end?: string
 }
@@ -99,6 +100,7 @@ export function AccountExportModal({
       if (request.filters.email) body.email = request.filters.email
       if (request.filters.status) body.status = request.filters.status
       if (request.filters.plus_status) body.plus_status = request.filters.plus_status
+      if (request.filters.sms_verified) body.sms_verified = request.filters.sms_verified
       if (request.filters.created_at_start) body.created_at_start = request.filters.created_at_start
       if (request.filters.created_at_end) body.created_at_end = request.filters.created_at_end
     }

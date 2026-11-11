@@ -138,6 +138,12 @@ class ChatGPTPlatform(BasePlatform):
     def execute_action(self, action_id: str, account: Account, params: dict) -> dict:
         proxy = self.config.proxy if self.config else None
         extra = account.extra or {}
+        from services.chatgpt_account_purpose import is_web_pool_account
+        web_only = is_web_pool_account(account)
+        if web_only and action_id in {
+            "upload_cpa", "upload_sub2api", "upload_tm", "upload_codex_proxy",
+        }:
+            return {"ok": False, "error": "Web 号池账号不会自动外传到 CPA／Sub2API／CodexProxy；如需请用普通账号流程"}
 
         class _A:
             pass
@@ -247,6 +253,8 @@ class ChatGPTPlatform(BasePlatform):
                 "data": {"message": result.summary(), "strategy": result.strategy},
                 "error": "" if result.success else result.summary(),
                 "account_extra_patch": build_extra_patch(result),
+                # 交给调用方决定要不要把账号改判为 deleted（OpenAI 说号已删除/停用）
+                "account_deleted": result.account_deleted,
             }
 
         if action_id == "bind_2fa":

@@ -225,17 +225,33 @@ def _build_icloud_provider(address: str, *, log_fn=None, **_kwargs):
     return ICloudAliasMailProvider(alias_id, address, log_fn=log_fn), ""
 
 
-def _build_outlook_provider(address: str, *, config: dict, proxy=None, otp_timeout=None, **_kwargs):
+def _build_outlook_provider(address: str, *, config: dict, account_extra: dict | None = None, proxy=None, otp_timeout=None, **_kwargs):
     from sqlmodel import Session
 
     from core.base_mailbox import MailboxAccount, create_mailbox
     from core.db import engine
     from platforms.chatgpt.protocol.mailbox_adapter import FixedAddressProviderAdapter
+    from types import SimpleNamespace
 
+    account_extra = dict(account_extra or {})
     with Session(engine) as session:
         row = _find_outlook_row(session, address)
-        if row is None:
+    if row is None:
+        # 备注：邮箱池已被注册消费时，使用账号中保存的微软凭据快照。
+        snapshot = {
+            "password": account_extra.get("outlook_password", ""),
+            "client_id": account_extra.get("outlook_client_id", ""),
+            "refresh_token": account_extra.get("outlook_refresh_token", ""),
+            "account_type": account_extra.get("outlook_account_type", "microsoft_oauth"),
+            "mailapi_url": account_extra.get("outlook_mailapi_url", ""),
+        }
+        if not any(snapshot.get(key) for key in ("password", "client_id", "refresh_token", "mailapi_url")):
             return None, ""
+        row = SimpleNamespace(
+            id=account_extra.get("mailbox_account_id", ""),
+            email=account_extra.get("mailbox_email") or address,
+            **snapshot,
+        )
         credentials = {
             "provider": "microsoft",
             "password": row.password or "",
@@ -247,6 +263,18 @@ def _build_outlook_provider(address: str, *, config: dict, proxy=None, otp_timeo
         account_id = str(row.id or "")
         # IMAP/OAuth 认的是号池里那条记录的地址，别名登不上去
         login_email = (row.email or "").strip() or address
+
+    # 备注：统一从池记录或快照对象读取凭据，避免分支缩进导致 provider 构建失败。
+    credentials = {
+        "provider": "microsoft",
+        "password": row.password or "",
+        "client_id": row.client_id or "",
+        "refresh_token": row.refresh_token or "",
+        "account_type": row.account_type or "microsoft_oauth",
+        "mailapi_url": row.mailapi_url or "",
+    }
+    account_id = str(row.id or "")
+    login_email = (row.email or "").strip() or address
 
     mailbox = create_mailbox("outlook", extra=config, proxy=proxy)
     account = MailboxAccount(email=login_email, account_id=account_id, extra=credentials)
@@ -306,6 +334,9 @@ def _build_configured_provider(
     ).strip()
     if not provider_key:
         return None, "没有配置邮箱服务"
+    # 备注：微软邮箱必须经过专用构建器校验凭据，禁止通用分支生成空凭据 provider。
+    if provider_key.lower() in {"microsoft", "outlook"}:
+        return None, "微软邮箱缺少可用的密码或 OAuth 凭据"
 
     domains = _configured_domains(provider_key, account_extra, config)
     if domains and not _domain_matches(address, domains):

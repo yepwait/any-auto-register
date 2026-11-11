@@ -9,8 +9,10 @@ from core.registry import get
 from core.base_platform import RegisterConfig
 from core.config_store import config_store
 from services.chatgpt_account_state import (
+    DELETED_ACCOUNT_STATUS,
     apply_chatgpt_status_policy,
     filter_accounts_by_plus_status,
+    filter_accounts_by_sms_verified,
 )
 from services.chatgpt_sync import update_account_model_cliproxy_sync
 
@@ -27,6 +29,7 @@ class BatchActionRequest(BaseModel):
     email: str = ""
     status: str = ""
     plus_status: str = ""
+    sms_verified: str = ""
     params: dict = {}
 
 
@@ -89,6 +92,13 @@ def _apply_action_result(
         # （补丁字段直接落 extra，不能拿去当展示文案），这里单独同步一次
         if str(patch.get("access_token") or "").strip():
             acc_model.token = patch["access_token"]
+        # 备注：单账号/批量补 RT 成功都要恢复主状态，不能只修批量任务入口；
+        # 但 OpenAI 明说号已被删除/停用时改记 deleted，免得继续拿死号重试。
+        if platform == "chatgpt" and action_id == "backfill_refresh_token":
+            if result.get("account_deleted"):
+                acc_model.status = DELETED_ACCOUNT_STATUS
+            elif result.get("ok"):
+                acc_model.status = "registered"
         from datetime import datetime, timezone
         acc_model.updated_at = datetime.now(timezone.utc)
         session.add(acc_model)
@@ -125,6 +135,9 @@ def _apply_action_result(
                 acc_model.token = data["access_token"]
             elif data.get("accessToken"):
                 acc_model.token = data["accessToken"]
+            # 备注：明确刷新出新 AT 时恢复历史 invalid，未知结果仍保持原状态。
+            if platform == "chatgpt" and action_id == "refresh_token":
+                acc_model.status = "registered"
             from datetime import datetime, timezone
 
             acc_model.updated_at = datetime.now(timezone.utc)
@@ -139,10 +152,16 @@ def _execute_platform_action(
     params: dict,
     session: Session,
 ) -> dict[str, Any]:
-    account = _to_platform_account(acc_model)
-    result = instance.execute_action(action_id, account, params)
-    _apply_action_result(platform, action_id, acc_model, result, session)
-    return result
+    from contextlib import nullcontext
+    from api.tasks import chatgpt_enqueue_lock, ensure_no_sms_stock_task
+
+    with chatgpt_enqueue_lock if platform == "chatgpt" else nullcontext():
+        if platform == "chatgpt":
+            ensure_no_sms_stock_task()
+        account = _to_platform_account(acc_model)
+        result = instance.execute_action(action_id, account, params)
+        _apply_action_result(platform, action_id, acc_model, result, session)
+        return result
 
 
 def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Session) -> tuple[list[AccountModel], list[int]]:
@@ -183,6 +202,8 @@ def _resolve_batch_accounts(platform: str, body: BatchActionRequest, session: Se
     rows = session.exec(query).all()
     if body.plus_status:
         rows = filter_accounts_by_plus_status(rows, body.plus_status)
+    if body.sms_verified:
+        rows = filter_accounts_by_sms_verified(rows, body.sms_verified)
     if len(rows) > 1000:
         raise HTTPException(400, "单次最多处理 1000 个账号")
     return rows, []

@@ -40,6 +40,19 @@ SMS_PHONE_LIFETIME = 20 * 60  # 号码租用窗口（秒）
 # OpenAI 走纯 SMS 的国家白名单（截至 2025-2026 实测；其它国家会抽到 WhatsApp 号）
 OPENAI_SMS_COUNTRIES = {"52"}
 
+
+class SmsProviderFatalError(RuntimeError):
+    """接码平台级致命错误：余额不足、密钥无效等，换号/重试都不会好转。"""
+
+
+# 这些平台返回码代表“账号级”问题，继续换号只会白烧请求，应停止租号并冷却。
+_FATAL_SMS_TOKENS = ("NO_BALANCE", "BAD_KEY", "INVALID_KEY", "NO_KEY", "WRONG_KEY")
+
+
+def _is_fatal_sms_error(text: Any) -> bool:
+    upper = str(text or "").upper()
+    return any(token in upper for token in _FATAL_SMS_TOKENS)
+
 SMS_PROVIDERS: dict[str, dict[str, str]] = {
     "smsbower": {
         "label": "SmsBower",
@@ -378,6 +391,7 @@ class SmsActivateProvider(BaseSmsProvider):
         max_price: float = 0,
         strict_whitelist: bool = False,
         allowed_countries: Optional[list[str]] = None,
+        blocked_countries: Optional[list[str]] = None,
     ) -> Optional[str]:
         """自动选最优国家。
 
@@ -396,10 +410,13 @@ class SmsActivateProvider(BaseSmsProvider):
         allowed_set: Optional[set[str]] = None
         if allowed_countries:
             allowed_set = {str(c).strip() for c in allowed_countries if str(c).strip()}
+        blocked_set = {str(c).strip() for c in (blocked_countries or []) if str(c).strip()}
 
         def _pick(stock_threshold: int) -> Optional[str]:
             for row in rows:
                 cid = str(row.get("country") or "")
+                if cid in blocked_set:
+                    continue
                 if allowed_set is not None:
                     if cid not in allowed_set:
                         continue
@@ -611,6 +628,11 @@ class SmsActivateProvider(BaseSmsProvider):
                     return activation
 
             detail = " | ".join(failures) if failures else "未知"
+            # 全是平台级致命错误（余额/密钥）时直接抛专门异常，让上层停止换号重试。
+            if failures and all(_is_fatal_sms_error(item) for item in failures):
+                raise SmsProviderFatalError(
+                    f"接码平台拒绝（余额或密钥问题）: {detail}"
+                ) from last_exc
             if "NO_NUMBERS" in detail:
                 self._explain_no_numbers(service_code, country_candidates)
             raise RuntimeError(
@@ -704,6 +726,7 @@ class SmsActivateProvider(BaseSmsProvider):
         *,
         timeout: int = 80,
         poll: int = 3,
+        stop_check: Optional[Callable[[], None]] = None,
     ) -> Optional[dict]:
         """等短信验证码：只轮询接码平台，不去催发。
 
@@ -719,6 +742,8 @@ class SmsActivateProvider(BaseSmsProvider):
         next_report = start + 30
 
         while time.time() < deadline:
+            if stop_check is not None:
+                stop_check()
             seen_this_round = []
             for source in ("v2", "v1"):
                 try:
@@ -771,10 +796,16 @@ class SmsActivateProvider(BaseSmsProvider):
             parts.append(detail[:80])
         return " ".join(parts)
 
-    def get_code(self, activation_id: str, *, timeout: int = 180) -> str:
+    def get_code(
+        self,
+        activation_id: str,
+        *,
+        timeout: int = 180,
+        stop_check: Optional[Callable[[], None]] = None,
+    ) -> str:
         # 传进来的 timeout 就是真 timeout：号码有 20 分钟生命周期，但 OpenAI 那边的
         # phone-otp challenge 等不了那么久，超时就该让上层换号。
-        candidate = self.wait_for_code(activation_id, timeout=timeout)
+        candidate = self.wait_for_code(activation_id, timeout=timeout, stop_check=stop_check)
         self.last_code_result = candidate
         return str((candidate or {}).get("code") or "")
 
@@ -925,6 +956,7 @@ class PhoneCallbackController:
         country: str = "",
         log_fn: Optional[Callable[[str], None]] = None,
         auto_select_country: bool = False,
+        task_control: Optional[object] = None,
     ):
         self.provider_key = provider_key
         self.config = dict(config or {})
@@ -932,11 +964,17 @@ class PhoneCallbackController:
         self.country = country
         self.log = log_fn or logger.info
         self.auto_select_country = bool(auto_select_country)
+        self.task_control = task_control
         self.provider: Optional[BaseSmsProvider] = None
         self.activation: Optional[SmsActivation] = None
         self.completed = False
         self._verify_lock_acquired = False
         self._warned_off_whitelist = False
+
+    def _checkpoint(self) -> None:
+        """把任务停止/跳过开关接进接码链路，避免停止后还在等码换号。"""
+        if self.task_control is not None:
+            self.task_control.checkpoint()
 
     def _ensure_provider(self) -> BaseSmsProvider:
         if self.provider is None:
@@ -945,10 +983,12 @@ class PhoneCallbackController:
 
     def get_phone(self) -> str:
         """阶段 1：租手机号（返回带 + 的 E.164）。"""
+        self._checkpoint()
         provider = self._ensure_provider()
-        # 同号复用锁，防止两个注册任务并发抢同一份缓存
+        # 同号复用锁，防止两个注册任务并发抢同一份缓存；等待锁时也要能响应停止。
         if isinstance(provider, SmsActivateProvider) and not self._verify_lock_acquired:
-            _SMS_VERIFY_LOCK.acquire()
+            while not _SMS_VERIFY_LOCK.acquire(timeout=0.5):
+                self._checkpoint()
             self._verify_lock_acquired = True
 
         candidates = self._resolve_country_candidates(provider)
@@ -992,9 +1032,19 @@ class PhoneCallbackController:
     def _resolve_country_candidates(self, provider: BaseSmsProvider) -> list[str]:
         allowed_raw = str(self.config.get("sms_allowed_countries") or "").strip()
         allowed = [c.strip() for c in allowed_raw.replace(";", ",").split(",") if c.strip()]
+        # 备注：黑名单优先级高于允许名单，避免自动选号误用已知失效号段。
+        blocked_raw = str(self.config.get("sms_blocked_countries") or "").strip()
+        blocked = {c.strip() for c in blocked_raw.replace(";", ",").split(",") if c.strip()}
+        if self.country and self.country in blocked and not self.auto_select_country:
+            raise RuntimeError(f"默认国家 {country_label(self.country)} 在黑名单中")
+        allowed = [c for c in allowed if c not in blocked]
+        if allowed_raw and not allowed:
+            raise RuntimeError("允许国家已全部被黑名单屏蔽")
 
         if not (self.auto_select_country and isinstance(provider, SmsActivateProvider)):
-            return [self.country] if self.country else [SMS_DEFAULT_COUNTRY]
+            return [self.country] if self.country and self.country not in {
+                c.strip() for c in str(self.config.get("sms_blocked_countries") or "").replace(";", ",").split(",") if c.strip()
+            } else [SMS_DEFAULT_COUNTRY]
 
         if allowed:
             self.log(f"自动选号: 从勾选的 {len(allowed)} 个国家按价格升序依次尝试")
@@ -1015,6 +1065,7 @@ class PhoneCallbackController:
                 min_stock=_safe_int(self.config.get("sms_auto_min_stock"), 20),
                 max_price=_safe_float(self.config.get("sms_auto_max_price"), 0),
                 strict_whitelist=_safe_bool(self.config.get("sms_strict_whitelist"), False),
+                blocked_countries=list(blocked),
             )
         except Exception as exc:
             self.log(f"国家智能选择失败（{exc}），使用默认国家")
@@ -1028,7 +1079,10 @@ class PhoneCallbackController:
             return [best]
 
         self.log("未找到满足条件的国家，使用默认国家")
-        return [self.country] if self.country else [SMS_DEFAULT_COUNTRY]
+        fallback = self.country or SMS_DEFAULT_COUNTRY
+        if fallback in blocked:
+            raise RuntimeError("默认国家也在黑名单中，无法租号")
+        return [fallback]
 
     def get_code(self, timeout: int = 180) -> str:
         """阶段 2：等待短信验证码。"""
@@ -1038,9 +1092,13 @@ class PhoneCallbackController:
         self.log(
             f"等待短信验证码…(activation_id={self.activation.activation_id} timeout={timeout}s)"
         )
-        code = provider.get_code(self.activation.activation_id, timeout=timeout)
+        self._checkpoint()
+        code = provider.get_code(
+            self.activation.activation_id, timeout=timeout, stop_check=self._checkpoint
+        )
         if code:
-            self.log(f"收到短信验证码: {code}")
+            # 只记长度，不把可直接使用的验证码写进持久化任务日志。
+            self.log(f"收到短信验证码（已隐藏，长度={len(code)}）")
             if getattr(provider, "auto_report_success_on_code", True):
                 self.report_success()
         else:
@@ -1125,6 +1183,7 @@ def build_phone_callback(
     *,
     log_fn: Optional[Callable[[str], None]] = None,
     proxy: Optional[str] = None,
+    task_control: Optional[object] = None,
 ) -> Optional[PhoneCallbackController]:
     """按配置构造接码控制器；未启用或缺 API Key 时返回 None。
 
@@ -1152,6 +1211,7 @@ def build_phone_callback(
             country=str(settings.get("sms_country") or "").strip() or SMS_DEFAULT_COUNTRY,
             log_fn=log_fn,
             auto_select_country=_safe_bool(settings.get("sms_auto_country"), False),
+            task_control=task_control,
         )
     except Exception as exc:
         logger.warning("创建接码控制器失败: %s", exc)

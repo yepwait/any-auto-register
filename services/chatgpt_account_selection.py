@@ -12,7 +12,7 @@ from typing import Callable, Iterable, Optional
 from sqlmodel import Session, select
 
 from core.db import AccountModel
-from services.chatgpt_account_state import filter_accounts_by_plus_status
+from services.chatgpt_account_state import filter_accounts_by_plus_status, filter_accounts_by_sms_verified
 
 MAX_BATCH_ACCOUNTS = 1000
 
@@ -41,6 +41,7 @@ def select_chatgpt_accounts(
     email: str = "",
     status: str = "",
     plus_status: str = "",
+    sms_verified: str = "",
     keep: Optional[Callable[[AccountModel], bool]] = None,
     max_accounts: int = MAX_BATCH_ACCOUNTS,
 ) -> tuple[list[AccountModel], list[int]]:
@@ -66,6 +67,8 @@ def select_chatgpt_accounts(
         accounts = list(session.exec(query).all())
         if plus_status:
             accounts = filter_accounts_by_plus_status(accounts, plus_status)
+        if sms_verified:
+            accounts = filter_accounts_by_sms_verified(accounts, sms_verified)
     else:
         raise ValueError("请提供 account_ids，或指定 all_filtered=true")
 

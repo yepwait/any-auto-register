@@ -9,6 +9,8 @@ from core.task_runtime import StopTaskRequested
 from platforms.chatgpt.rt_backfill import (
     STRATEGY_LOGIN,
     STRATEGY_SESSION,
+    BackfillAttempt,
+    BackfillResult,
     MailboxUnavailableProvider,
     RefreshTokenBackfiller,
 )
@@ -96,6 +98,30 @@ class RefreshTokenBackfillerTests(unittest.TestCase):
         self.assertEqual(result.access_token, "at-new")
         self.assertEqual(flow.codex_calls, 1)
         self.assertEqual(flow.login_calls, [])
+
+    def test_looks_deleted_only_matches_openai_wording(self):
+        """只有明确读到"已删除或停用"才算 deleted，其余失败原因一律不算。"""
+        backfiller = _backfiller([])
+
+        deleted = BackfillResult(
+            success=False,
+            attempts=[
+                BackfillAttempt(
+                    STRATEGY_LOGIN,
+                    False,
+                    "403 - You do not have an account because it has been deleted or deactivated.",
+                )
+            ],
+        )
+        self.assertTrue(backfiller._looks_deleted(deleted))
+
+        for message in ("密码错误", "会话失效", "403 Forbidden", "收件箱读不到验证码"):
+            self.assertFalse(
+                backfiller._looks_deleted(
+                    BackfillResult(success=False, attempts=[BackfillAttempt(STRATEGY_LOGIN, False, message)])
+                ),
+                message,
+            )
 
     def test_falls_back_to_protocol_login_when_session_yields_nothing(self):
         session_flow = _FakeFlow()
@@ -339,7 +365,13 @@ class BackfillPersistenceTests(unittest.TestCase):
         self.assertFalse(patch["chatgpt_rt_backfill"]["ok"])
 
     def test_apply_result_updates_extra_and_token_without_dropping_old_fields(self):
-        model = AccountModel(platform="chatgpt", email="demo@example.com", password="pw", token="at-old")
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            token="at-old",
+            status="invalid",
+        )
         model.set_extra({"session_token": "st-old", "cookies": "c=1"})
         before = model.updated_at - timedelta(seconds=1)
         model.updated_at = before
@@ -351,8 +383,50 @@ class BackfillPersistenceTests(unittest.TestCase):
         self.assertEqual(extra["session_token"], "st-old")
         self.assertEqual(extra["cookies"], "c=1")
         self.assertEqual(model.token, "at-new")
+        self.assertEqual(model.status, "registered")
         self.assertGreater(model.updated_at.replace(tzinfo=timezone.utc), before.replace(tzinfo=timezone.utc))
         self.assertIn("chatgpt_rt_backfill", patch)
+
+    def test_apply_result_marks_deleted_account(self):
+        """OpenAI 说号已被删除/停用时落 deleted，而不是继续留在 registered。"""
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            token="at-old",
+            status="registered",
+        )
+        model.set_extra({})
+
+        result = self._result(
+            success=False,
+            strategy="",
+            refresh_token="",
+            access_token="",
+            account_deleted=True,
+            error_message="补 RT 失败（协议重登：账号已被删除或停用）",
+        )
+        apply_backfill_result(model, result)
+
+        self.assertEqual(model.status, "deleted")
+        self.assertFalse(model.get_extra()["chatgpt_rt_backfill"]["ok"])
+
+    def test_apply_result_keeps_status_on_plain_failure(self):
+        """普通失败（会话失效、密码错）不能顺手把号改死。"""
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            status="registered",
+        )
+        model.set_extra({})
+
+        apply_backfill_result(
+            model,
+            self._result(success=False, strategy="", refresh_token="", access_token=""),
+        )
+
+        self.assertEqual(model.status, "registered")
 
     def test_account_missing_rt_detects_both_key_spellings(self):
         model = AccountModel(platform="chatgpt", email="a@b.c", password="pw")
@@ -457,7 +531,13 @@ class PluginActionTests(unittest.TestCase):
     def test_action_result_syncs_access_token_onto_the_account_row(self):
         from api.actions import _apply_action_result
 
-        model = AccountModel(platform="chatgpt", email="demo@example.com", password="pw", token="at-old")
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            token="at-old",
+            status="invalid",
+        )
         model.set_extra({"session_token": "st-old"})
         result = {
             "ok": True,
@@ -468,8 +548,59 @@ class PluginActionTests(unittest.TestCase):
         _apply_action_result("chatgpt", "backfill_refresh_token", model, result, mock.Mock())
 
         self.assertEqual(model.token, "at-new")
+        self.assertEqual(model.status, "registered")
         self.assertEqual(model.get_extra()["refresh_token"], "rt-new")
         self.assertEqual(model.get_extra()["session_token"], "st-old")
+
+    def test_action_marks_account_deleted(self):
+        """插件把引擎的 account_deleted 透出来，落库层据此改判 deleted。"""
+        from api.actions import _apply_action_result
+
+        action_result, _ = self._run_action(
+            BackfillResult(
+                success=False,
+                account_deleted=True,
+                error_message="补 RT 失败（协议重登：账号已被删除或停用）",
+            )
+        )
+        self.assertFalse(action_result["ok"])
+        self.assertTrue(action_result["account_deleted"])
+
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            token="at-old",
+            status="registered",
+        )
+        model.set_extra({"session_token": "st-old"})
+
+        _apply_action_result("chatgpt", "backfill_refresh_token", model, action_result, mock.Mock())
+
+        self.assertEqual(model.status, "deleted")
+        self.assertEqual(model.get_extra()["session_token"], "st-old")
+
+    def test_action_result_keeps_registered_on_plain_failure(self):
+        """普通补 RT 失败不该动账号状态。"""
+        from api.actions import _apply_action_result
+
+        model = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="pw",
+            status="registered",
+        )
+        model.set_extra({})
+        result = {
+            "ok": False,
+            "error": "补 RT 失败（协议重登：密码错误）",
+            "account_deleted": False,
+            "account_extra_patch": {"chatgpt_rt_backfill": {"ok": False}},
+        }
+
+        _apply_action_result("chatgpt", "backfill_refresh_token", model, result, mock.Mock())
+
+        self.assertEqual(model.status, "registered")
 
 
 if __name__ == "__main__":

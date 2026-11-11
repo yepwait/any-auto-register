@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from core.base_mailbox import BaseMailbox
+from core.task_runtime import TaskInterruption
 from platforms.chatgpt.protocol import AuthFlow, AuthResult, Config
+from platforms.chatgpt.protocol.auth_flow import PhoneVerificationRequiredError
 from platforms.chatgpt.protocol.mailbox_adapter import MailboxProviderAdapter
 from platforms.chatgpt.protocol.two_factor import (
     TwoFactorBindResult,
@@ -85,12 +87,20 @@ class RegistrationResult:
                 "totp_secret": result.totp_secret,
                 "phone_number": phone_number,
                 "bound_email": bound_email,
+                "sms_verification": getattr(result, "sms_verification", {}),
             },
+
         )
 
 
 def generate_password(length: int = 16) -> str:
     return "".join(random.choices(_PASSWORD_ALPHABET, k=length))
+
+
+def is_chatgpt_web_only(extra: Optional[dict]) -> bool:
+    return str((extra or {}).get("chatgpt_web_only", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 class ChatGPTRegistrationEngine:
@@ -120,6 +130,11 @@ class ChatGPTRegistrationEngine:
         self.mailbox_kind = mailbox_kind
         self.register_flow = register_flow or REGISTER_FLOW_EMAIL
         self.bind_2fa = bool(bind_2fa)
+        self.web_only = is_chatgpt_web_only(self.extra_config)
+        if self.web_only:
+            self.mode = REGISTRATION_MODE_ACCESS_TOKEN_ONLY
+            self.register_flow = REGISTER_FLOW_EMAIL
+            self.bind_2fa = False
         self.flow: Optional[AuthFlow] = None
         self.two_factor: Optional[TwoFactorBindResult] = None
 
@@ -134,13 +149,32 @@ class ChatGPTRegistrationEngine:
 
         try:
             result = flow.run_register(provider)
+            # 协议中的兜底分支可能吞掉异常，正常返回也必须检查持久标记。
+            if self.web_only and getattr(flow, "_phone_verification_required", False):
+                raise PhoneVerificationRequiredError()
+        except TaskInterruption:
+            raise
         except Exception as exc:
             registration = self._salvage(flow, exc)
             self._set_mailbox_status(provider, "used" if registration.success else "failed")
             return self._attach_mailbox_credentials(registration, provider)
 
+        registration = RegistrationResult.from_auth_result(result)
+        # Web 池上传只接受 access_token；只有 session/RT 的号在远端无法入池，不能算成功。
+        if self.web_only and not str(result.access_token or "").strip():
+            self._set_mailbox_status(provider, "failed")
+            return self._attach_mailbox_credentials(
+                RegistrationResult(
+                    success=False,
+                    email=registration.email or self.email,
+                    password=registration.password or self.password,
+                    error_message="Web-only 注册未取得 access_token，不能上传到 Web 池",
+                    retryable=False,
+                ),
+                provider,
+            )
         self._ensure_two_factor(flow, provider)
-        registration = self._attach_two_factor(RegistrationResult.from_auth_result(result))
+        registration = self._attach_two_factor(registration)
         self._set_mailbox_status(provider, "used")
         return self._attach_mailbox_credentials(registration, provider)
 
@@ -164,6 +198,8 @@ class ChatGPTRegistrationEngine:
         try:
             with mirror_protocol_logs(self.log):
                 result = flow.run_phone_register(mail_provider=provider, bind_email=bind_email)
+        except TaskInterruption:
+            raise
         except Exception as exc:
             registration = self._salvage(flow, exc)
             self._set_mailbox_status(provider, "used" if registration.success else "failed")
@@ -246,7 +282,10 @@ class ChatGPTRegistrationEngine:
     def _build_flow(self, sms_callback: Optional[object] = None) -> AuthFlow:
         flow = AuthFlow(
             Config(proxy=self.proxy),
-            sms_callback=sms_callback if sms_callback is not None else self._build_sms_callback(),
+            sms_callback=(
+                None if self.web_only
+                else sms_callback if sms_callback is not None else self._build_sms_callback()
+            ),
             env_overrides=self._env_overrides(),
             on_password=self._on_password,
             # 不开 2FA 就一个钩子都不挂：挂上会顺带关掉 callback 前那次 Codex 抢跑
@@ -335,6 +374,8 @@ class ChatGPTRegistrationEngine:
         return registration
 
     def _build_sms_callback(self):
+        if self.web_only:
+            return None
         settings = resolve_sms_settings(self.extra_config)
         controller = build_phone_callback(
             settings,
@@ -355,10 +396,26 @@ class ChatGPTRegistrationEngine:
             "WEBUI_ALLOW_LOGIN": "1",
         }
 
+        if str(self.extra_config.get("chatgpt_require_sms_verified", "")).lower() in {"1", "true"}:
+            # 接码库存任务命中手机验证就完成验证，不尝试刷新授权来跳过它。
+            overrides["OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY"] = "0"
+
         if self.mode == REGISTRATION_MODE_ACCESS_TOKEN_ONLY:
             # 不要 refresh_token 就别跑 Codex OAuth：每次都要多花约 10 秒且必然告警
             overrides["OAUTH_CODEX_RT_EXCHANGE"] = "0"
             overrides["OAUTH_CODEX_RT_BEFORE_CALLBACK"] = "0"
+
+        if self.web_only:
+            # 仅覆盖本实例；不读全局接码设置，也不允许环境手机号/命令兜底。
+            overrides.update({
+                "OPENAI_DISABLE_PHONE_VERIFICATION": "1",
+                "OPENAI_PHONE_NUMBER": "",
+                "OPENAI_PHONE_OTP": "",
+                "OPENAI_PHONE_OTP_CMD": "",
+                "OAUTH_REFRESH_ONLY": "0",
+                "OAUTH_CODEX_ADD_PHONE_REFRESH_RETRY": "0",
+            })
+            return overrides
 
         for config_key, env_key in (
             ("sms_per_phone_timeout", "OPENAI_PHONE_OTP_TIMEOUT"),
@@ -391,15 +448,25 @@ class ChatGPTRegistrationEngine:
         账号完全可用，只是没有 refresh_token。这种情况按成功处理，把缺什么记在
         metadata 里，比让调用方重跑一遍浪费一个邮箱划算。
         """
+        if isinstance(exc, TaskInterruption):
+            raise exc
         result = flow.result
+        phone_required = isinstance(exc, PhoneVerificationRequiredError) or (
+            self.web_only and getattr(flow, "_phone_verification_required", False)
+        )
+        if phone_required:
+            exc = PhoneVerificationRequiredError()
         has_credentials = bool(result.access_token or result.session_token or result.refresh_token)
-        if not has_credentials:
+        web_missing_at = self.web_only and not str(result.access_token or "").strip()
+        if phone_required or web_missing_at or not has_credentials:
+            if web_missing_at and not phone_required:
+                exc = RuntimeError("Web-only 注册未取得 access_token，不能上传到 Web 池")
             return RegistrationResult(
                 success=False,
                 email=getattr(result, "bound_email", "") or result.email or self.email,
                 password=result.password or self.password,
                 error_message=str(exc),
-                retryable=bool(getattr(exc, "retryable", True)),
+                retryable=False if web_missing_at else bool(getattr(exc, "retryable", True)),
             )
 
         needs_refresh_token = self.mode == REGISTRATION_MODE_REFRESH_TOKEN

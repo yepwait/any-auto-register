@@ -356,6 +356,12 @@ const TAB_ITEMS = [
             type: 'country-multi',
             placeholder: '留空则全平台自由选',
           },
+          {
+            key: 'sms_blocked_countries',
+            label: '国家黑名单（优先屏蔽）',
+            type: 'country-multi',
+            placeholder: '选择后自动选号永不使用',
+          },
           { key: 'sms_auto_min_stock', label: '自动选号最低库存', placeholder: '20' },
           { key: 'sms_auto_max_price', label: '自动选号价格上限', placeholder: '0 表示不限' },
         ],
@@ -1428,6 +1434,7 @@ export default function Settings() {
       }
       // 库里存的是 "52,4,10"，下拉要的是数组
       data.sms_allowed_countries = parseCountryIdList(data.sms_allowed_countries)
+      data.sms_blocked_countries = parseCountryIdList(data.sms_blocked_countries)
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
@@ -1502,6 +1509,8 @@ export default function Settings() {
       }
       const allowedCountries = parseCountryIdList(values.sms_allowed_countries)
       values.sms_allowed_countries = allowedCountries.join(',')
+      const blockedCountries = parseCountryIdList(values.sms_blocked_countries)
+      values.sms_blocked_countries = blockedCountries.join(',')
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
         if (!Number.isInteger(rawDomainLevelCount) || rawDomainLevelCount < 2) {
@@ -1529,6 +1538,8 @@ export default function Settings() {
         email_domain_rule_enabled: values.email_domain_rule_enabled,
         email_domain_level_count: values.email_domain_level_count,
         sms_allowed_countries: allowedCountries,
+        // 备注：保存后同步回填黑名单，避免设置页显示为空造成误解。
+        sms_blocked_countries: blockedCountries,
         ...Object.fromEntries(SMS_BOOLEAN_KEYS.map((key) => [key, values[key]])),
       })
       message.success('保存成功')

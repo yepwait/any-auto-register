@@ -1,5 +1,5 @@
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom'
-import { useState, useEffect } from 'react'
+import { lazy, Suspense, useState, useEffect } from 'react'
 import { App as AntdApp, ConfigProvider, Layout, Menu, Button, Spin } from 'antd'
 import {
   DashboardOutlined,
@@ -12,22 +12,26 @@ import {
   LogoutOutlined,
   PlayCircleOutlined,
   CreditCardOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/es/locale/zh_CN'
-import Dashboard from '@/pages/Dashboard'
-import Accounts from '@/pages/Accounts'
-import ICloudPage from '@/pages/ICloud'
-import RegisterTaskPage from '@/pages/RegisterTaskPage'
-import Proxies from '@/pages/Proxies'
-import Settings from '@/pages/Settings'
-import TaskHistory from '@/pages/TaskHistory'
-import RunningTasks from '@/pages/RunningTasks'
-import Payments from '@/pages/Payments'
-import Login from '@/pages/Login'
+const Dashboard = lazy(() => import('@/pages/Dashboard'))
+const Accounts = lazy(() => import('@/pages/Accounts'))
+const ICloudPage = lazy(() => import('@/pages/ICloud'))
+const RegisterTaskPage = lazy(() => import('@/pages/RegisterTaskPage'))
+const Proxies = lazy(() => import('@/pages/Proxies'))
+const Settings = lazy(() => import('@/pages/Settings'))
+const TaskHistory = lazy(() => import('@/pages/TaskHistory'))
+const RunningTasks = lazy(() => import('@/pages/RunningTasks'))
+const Payments = lazy(() => import('@/pages/Payments'))
+const Inspection = lazy(() => import('@/pages/Inspection'))
+const SmsStock = lazy(() => import('@/pages/SmsStock'))
+const Login = lazy(() => import('@/pages/Login'))
 import { applyThemeVars, darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
 
 const { Sider, Content } = Layout
+const ChatgptWebPool = lazy(() => import('@/pages/ChatgptWebPool'))
 
 function ProtectedLayout() {
   const navigate = useNavigate()
@@ -96,6 +100,9 @@ function AppContent() {
     if (path === '/settings') return ['/settings']
     if (path === '/running-tasks') return ['/running-tasks']
     if (path === '/payments') return ['/payments']
+    if (path.startsWith('/inspection')) return ['/inspection']
+    if (path.startsWith('/chatgpt-web-pool')) return ['/chatgpt-web-pool']
+    if (path.startsWith('/sms-stock')) return ['/sms-stock']
     return ['/']
   }
 
@@ -109,6 +116,21 @@ function AppContent() {
       key: '/running-tasks',
       icon: <PlayCircleOutlined />,
       label: '任务运行',
+    },
+    {
+      key: '/inspection',
+      icon: <SafetyCertificateOutlined />,
+      label: 'Codex／RT 巡检',
+    },
+    {
+      key: '/chatgpt-web-pool',
+      icon: <GlobalOutlined />,
+      label: 'Web 池巡检',
+    },
+    {
+      key: '/sms-stock',
+      icon: <SafetyCertificateOutlined />,
+      label: '接码自动补库',
     },
     {
       key: '/payments',
@@ -226,6 +248,7 @@ function AppContent() {
             background: 'var(--bg-layout)',
           }}
         >
+          <Suspense fallback={<div style={{ padding: 80, textAlign: 'center' }}><Spin size="large" /></div>}>
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/accounts" element={<Accounts />} />
@@ -234,10 +257,18 @@ function AppContent() {
             <Route path="/icloud" element={<ICloudPage />} />
             <Route path="/running-tasks" element={<RunningTasks />} />
             <Route path="/payments" element={<Payments />} />
+            <Route path="/inspection" element={<Inspection />} />
+            <Route path="/chatgpt-web-pool" element={
+              <Suspense fallback={<div style={{ padding: 80, textAlign: 'center' }}><Spin size="large" /></div>}>
+                <ChatgptWebPool />
+              </Suspense>
+            } />
+            <Route path="/sms-stock" element={<SmsStock />} />
             <Route path="/history" element={<TaskHistory />} />
             <Route path="/proxies" element={<Proxies />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
+          </Suspense>
         </Content>
       </Layout>
       </AntdApp>
@@ -248,10 +279,12 @@ function AppContent() {
 export default function App() {
   return (
     <BrowserRouter>
-      <Routes>
-        <Route path="/login" element={<Login />} />
-        <Route path="/*" element={<ProtectedLayout />} />
-      </Routes>
+      <Suspense fallback={<div style={{ padding: 80, textAlign: 'center' }}><Spin size="large" /></div>}>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route path="/*" element={<ProtectedLayout />} />
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   )
 }

@@ -279,6 +279,18 @@ class ResolveProviderTests(unittest.TestCase):
         factory.assert_not_called()
         self.assertIsNone(provider)
 
+    def test_global_microsoft_config_does_not_create_empty_provider(self):
+        # 备注：专用回查失败后不能再由通用分支构建空凭据邮箱，否则会无效轮询到超时。
+        with mock.patch("core.base_mailbox.create_mailbox") as factory:
+            provider, reason = resolve_otp_mail_provider(
+                "legacy@outlook.com",
+                config={"mail_provider": "microsoft"},
+            )
+
+        factory.assert_not_called()
+        self.assertIsNone(provider)
+        self.assertIn("缺少可用", reason)
+
     def test_configured_provider_used_when_domain_matches(self):
         mailbox = _StubMailbox(ids=set())
 

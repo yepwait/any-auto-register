@@ -1,7 +1,13 @@
 import unittest
+from email.message import EmailMessage
 from unittest import mock
 
-from core.base_mailbox import MailboxAccount, OutlookMailbox, create_mailbox
+from core.base_mailbox import (
+    MailboxAccount,
+    OutlookImapMailboxBackend,
+    OutlookMailbox,
+    create_mailbox,
+)
 
 
 class _SelectFallbackImap:
@@ -29,17 +35,85 @@ class _FakeResponse:
         return dict(self._payload)
 
 
+def _outlook_message(code: str, date: str) -> bytes:
+    message = EmailMessage()
+    message["Subject"] = "Your temporary ChatGPT verification code"
+    message["Date"] = date
+    message.set_content(f"Your verification code is {code}")
+    return message.as_bytes()
+
+
+class _FakeOutlookImap:
+    """备注：按文件夹返回 UID 和邮件，复现 Outlook 的目录选择行为。"""
+
+    def __init__(self, messages_by_folder=None, fail_folders=None):
+        self.messages_by_folder = messages_by_folder or {}
+        self.fail_folders = set(fail_folders or set())
+        self.selected = ""
+        self.selections = []
+
+    def select(self, folder, readonly=True):
+        self.selections.append((folder, readonly))
+        if folder in self.fail_folders:
+            raise RuntimeError("folder unavailable")
+        self.selected = folder
+        return "OK", [b"1"]
+
+    def uid(self, command, *args):
+        messages = self.messages_by_folder.get(self.selected, [])
+        if command == "search":
+            return "OK", [b" ".join(str(uid).encode() for uid, _ in messages)]
+        if command == "fetch":
+            target = int(args[0])
+            raw = next(raw for uid, raw in messages if uid == target)
+            return "OK", [(b"RFC822", raw)]
+        raise AssertionError(f"unexpected UID command: {command}")
+
+    def logout(self):
+        return "BYE", [b""]
+
+
 class OutlookMailboxOAuthTests(unittest.TestCase):
-    def test_imap_select_falls_back_to_mutable_select_when_examine_is_rejected(self):
-        mailbox = OutlookMailbox()
-        connection = _SelectFallbackImap()
+    def test_imap_baseline_quotes_folders_and_keeps_partial_results(self):
+        mailbox = OutlookMailbox(backend="imap")
+        mailbox._imap_folder_names = ["INBOX", "Deleted Items", "Trash"]
+        fake_imap = _FakeOutlookImap(
+            messages_by_folder={
+                '"INBOX"': [(1, b"")],
+                '"Deleted Items"': [(2, b"")],
+            },
+            fail_folders={'"Trash"'},
+        )
+        account = MailboxAccount(email="demo@outlook.com", extra={})
 
-        with mock.patch.object(mailbox, "_log") as log:
-            result = mailbox._backends["imap"]._select_folder(connection, "INBOX")
+        with mock.patch.object(mailbox, "_open_imap", return_value=fake_imap):
+            ids = OutlookImapMailboxBackend(mailbox).get_current_ids(account)
 
-        self.assertEqual(result[0], "OK")
-        self.assertEqual(connection.calls, [("INBOX", True), ("INBOX", False)])
-        log.assert_called_once()
+        self.assertEqual(ids, {"INBOX:1", "Deleted Items:2"})
+        self.assertIn(('"Deleted Items"', True), fake_imap.selections)
+
+    def test_imap_wait_for_code_skips_message_older_than_otp_request(self):
+        mailbox = OutlookMailbox(backend="imap")
+        mailbox._imap_folder_names = ["INBOX"]
+        fake_imap = _FakeOutlookImap(
+            messages_by_folder={
+                '"INBOX"': [
+                    (1, _outlook_message("111111", "Thu, 27 Aug 2026 03:00:00 +0000")),
+                    (2, _outlook_message("222222", "Thu, 27 Aug 2026 05:00:00 +0000")),
+                ]
+            }
+        )
+        account = MailboxAccount(email="demo@outlook.com", extra={})
+
+        with mock.patch.object(mailbox, "_open_imap", return_value=fake_imap):
+            code = OutlookImapMailboxBackend(mailbox).wait_for_code(
+                account,
+                timeout=1,
+                before_ids=set(),
+                otp_sent_at=1787803200,
+            )
+
+        self.assertEqual(code, "222222")
 
     def test_create_mailbox_outlook_defaults_to_graph_backend(self):
         mailbox = create_mailbox("outlook", extra={})
@@ -47,24 +121,48 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertIsInstance(mailbox, OutlookMailbox)
         self.assertEqual(mailbox._backend_name, "graph")
 
-    def test_graph_backend_delegates_to_imap_after_imap_scope_is_detected(self):
-        mailbox = OutlookMailbox()
+    @mock.patch("imaplib.IMAP4_SSL", side_effect=OSError("connection refused"))
+    def test_imap_login_error_keeps_host_and_auth_method(self, _imap_ssl):
+        mailbox = OutlookMailbox(backend="imap")
         account = MailboxAccount(
             email="demo@outlook.com",
-            extra={"client_id": "client-id", "refresh_token": "refresh-token"},
+            extra={"password": "app-password"},
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"outlook\.live\.com:password:OSError: connection refused.*outlook\.office365\.com:password",
+        ):
+            mailbox._open_imap(account)
+
+    def test_graph_backend_falls_back_to_imap_scope_token(self):
+        mailbox = OutlookMailbox(backend="graph")
+        account = MailboxAccount(
+            email="demo@outlook.com",
+            extra={
+                "client_id": "client-id",
+                "refresh_token": "refresh-token",
+                "_oauth_token_cache": {"graph": {"scope_label": "imap_new"}},
+            },
         )
         with mock.patch.object(
             mailbox,
             "_get_oauth_access_token",
-            side_effect=lambda _account, **_kwargs: account.extra.update(_oauth_backend_capability="imap") or "imap-token",
-        ), mock.patch.object(
-            mailbox._backends["imap"],
-            "get_current_ids",
-            return_value={"INBOX:1"},
-        ) as imap_ids:
-            result = mailbox._backends["graph"].get_current_ids(account)
-        self.assertEqual(result, {"INBOX:1"})
-        imap_ids.assert_called_once_with(account)
+            return_value="opaque-imap-token",
+        ):
+            backend = mailbox._resolve_backend(account)
+
+        self.assertEqual(backend.backend_name, "imap")
+
+    def test_create_mailbox_outlook_does_not_inherit_registration_proxy(self):
+        # 备注：注册代理只服务注册流量，微软 OAuth/Graph/IMAP 与参考项目一致走直连。
+        mailbox = create_mailbox(
+            "microsoft",
+            extra={},
+            proxy="proxy-user:proxy-pass@proxy.example.test:10000",
+        )
+
+        self.assertIsNone(mailbox._proxy)
 
     @mock.patch("requests.post")
     def test_fetch_oauth_token_graph_backend_prefers_graph_scope(self, mock_post):
@@ -127,6 +225,34 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(
             mock_post.call_args.kwargs["data"].get("scope", ""),
             "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+        )
+
+    @mock.patch("requests.post")
+    def test_probe_oauth_availability_normalizes_proxy_without_scheme(self, mock_post):
+        # 备注：复现代理池返回 user:pass@host:port 时 OAuth 请求被 requests 拒绝的问题。
+        mailbox = OutlookMailbox(
+            token_endpoint="https://token.example.test",
+            proxy="proxy-user:proxy-pass@proxy.example.test:10000",
+        )
+        mock_post.return_value = _FakeResponse(
+            200,
+            payload={"access_token": "ok-token"},
+            text='{"access_token":"ok-token"}',
+        )
+
+        result = mailbox.probe_oauth_availability(
+            email="demo@outlook.com",
+            client_id="client-id",
+            refresh_token="refresh-token",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            mock_post.call_args.kwargs["proxies"],
+            {
+                "http": "http://proxy-user:proxy-pass@proxy.example.test:10000",
+                "https": "http://proxy-user:proxy-pass@proxy.example.test:10000",
+            },
         )
 
     @mock.patch("requests.post")

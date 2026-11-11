@@ -105,6 +105,76 @@ class CliproxyapiSyncTests(unittest.TestCase):
         self.assertEqual(result["auth_index"], "auth-001")
         self.assertEqual(result["remote_state"], "usable")
 
+    def test_sync_preserves_cpa_relogin_required_over_old_token_probe(self):
+        account = DummyAccount(email="demo@example.com", user_id="acct-123")
+        auth_files = [
+            {
+                "name": "demo@example.com.json",
+                "provider": "codex",
+                "email": "demo@example.com",
+                "auth_index": "auth-001",
+                "status": "error",
+                "status_message": "需要重新登录",
+                "unavailable": False,
+            }
+        ]
+
+        with mock.patch("services.cliproxyapi_sync.list_auth_files", return_value=auth_files):
+            with mock.patch(
+                "services.cliproxyapi_sync._probe_remote_auth",
+                return_value={
+                    "last_probe_at": "2026-08-26T00:00:00Z",
+                    "last_probe_status_code": 200,
+                    "last_probe_error_code": "",
+                    "last_probe_message": "ok",
+                    "remote_state": "usable",
+                },
+            ):
+                result = sync_chatgpt_cliproxyapi_status(
+                    account,
+                    api_url="http://127.0.0.1:8317",
+                    api_key="demo",
+                )
+
+        # 备注：旧 AT 还能调用成功，不代表 CPA 的自动刷新链不需要重新登录。
+        self.assertEqual(result["remote_state"], "relogin_required")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["status_message"], "需要重新登录")
+
+    def test_sync_treats_error_status_as_relogin_when_probe_is_200(self):
+        account = DummyAccount(email="demo@example.com", user_id="acct-123")
+        auth_files = [
+            {
+                "name": "demo@example.com.json",
+                "provider": "codex",
+                "email": "demo@example.com",
+                "auth_index": "auth-001",
+                "status": "error",
+                "status_message": "",
+                "unavailable": False,
+            }
+        ]
+
+        with mock.patch("services.cliproxyapi_sync.list_auth_files", return_value=auth_files):
+            with mock.patch(
+                "services.cliproxyapi_sync._probe_remote_auth",
+                return_value={
+                    "last_probe_at": "2026-08-26T00:00:00Z",
+                    "last_probe_status_code": 200,
+                    "last_probe_error_code": "",
+                    "last_probe_message": "ok",
+                    "remote_state": "usable",
+                },
+            ):
+                result = sync_chatgpt_cliproxyapi_status(
+                    account,
+                    api_url="http://127.0.0.1:8317",
+                    api_key="demo",
+                )
+
+        # 备注：CPA 的 error 没有附带文案时，也不能被旧 AT 的 200 判成远端可用。
+        self.assertEqual(result["remote_state"], "relogin_required")
+
     def test_probe_remote_auth_maps_token_invalidated(self):
         with mock.patch(
             "services.cliproxyapi_sync._request_json",

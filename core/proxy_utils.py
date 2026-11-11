@@ -87,17 +87,24 @@ def is_authenticated_socks5_proxy(proxy_url: Optional[str]) -> bool:
 
 
 def normalize_proxy_url(proxy_url: Optional[str]) -> Optional[str]:
-    """将 socks5:// 规范化为 socks5h://，避免本地 DNS 泄漏。"""
+    """补齐 HTTP 协议，并将 socks5:// 规范化为 socks5h://。"""
     if proxy_url is None:
         return None
 
     value = str(proxy_url).strip()
     if not value:
         return None
+    if value.startswith("{"):
+        return value
 
-    legacy = _parse_legacy_proxy(value)
-    if legacy:
-        return _legacy_to_url(legacy)
+    # Parse host:port:user:pass BEFORE adding a scheme; otherwise the legacy
+    # parser mistakes //host for the host, causing repeated failed retries.
+    if "://" not in value:
+        legacy = _parse_legacy_proxy(value)
+        if legacy:
+            return _legacy_to_url(legacy)
+        # Proxy pools also return user:pass@host:port.
+        value = f"http://{value}"
 
     parts = urlsplit(value)
     if (parts.scheme or "").lower() == "socks5":

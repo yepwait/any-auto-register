@@ -17,6 +17,11 @@ from sqlmodel import Session
 from core.db import AccountModel
 from platforms.chatgpt.rt_backfill import BackfillResult, RefreshTokenBackfiller
 from services.chatgpt_account_selection import select_chatgpt_accounts
+from services.chatgpt_account_state import (
+    DELETED_ACCOUNT_STATUS,
+    INVALID_ACCOUNT_STATUS,
+    REGISTERED_ACCOUNT_STATUS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +43,7 @@ def select_backfill_targets(
     email: str = "",
     status: str = "",
     plus_status: str = "",
+    sms_verified: str = "",
     only_missing_rt: bool = True,
 ) -> tuple[list[AccountModel], list[int]]:
     """挑出要补 RT 的号，返回 ``(账号列表, 找不到的 id)``。
@@ -52,6 +58,7 @@ def select_backfill_targets(
         email=email,
         status=status,
         plus_status=plus_status,
+        sms_verified=sms_verified,
         keep=account_missing_rt if only_missing_rt else None,
     )
 
@@ -111,6 +118,7 @@ def backfill_account_data(
         mail_unavailable_reason=mail_reason,
         allow_login=allow_login,
         log_fn=log,
+        task_control=task_control,
     ).run()
 
 
@@ -127,6 +135,8 @@ def build_extra_patch(result: BackfillResult) -> dict[str, Any]:
             patch[key] = value
     if result.cookie_header:
         patch["cookies"] = result.cookie_header
+    if result.sms_verification:
+        patch["sms_verification"] = result.sms_verification
     if result.refresh_token:
         # 号已经有 RT 了，别再被当成 access_token_only 方案的产物
         patch["chatgpt_has_refresh_token_solution"] = True
@@ -157,6 +167,18 @@ def apply_backfill_result(
     model.set_extra(extra)
     if patch.get("access_token"):
         model.token = patch["access_token"]
+    # 备注：OpenAI 明说这号已被删除/停用时单独记 deleted，别让运营再拿死号去补 RT。
+    # 这条优先于 success —— 极少数情况下末段报错但 RT 已到手，那也已经是死号了。
+    if result.account_deleted:
+        model.status = DELETED_ACCOUNT_STATUS
+    # 备注：补 RT 成功代表凭证恢复，只把历史 invalid/deleted 洗回 registered；
+    # trial/subscribed 是订阅维度，不能被补 RT 顺手抹成 registered。
+    elif result.success and str(getattr(model, "status", "") or "").lower() in {
+        INVALID_ACCOUNT_STATUS,
+        DELETED_ACCOUNT_STATUS,
+        "",
+    }:
+        model.status = REGISTERED_ACCOUNT_STATUS
     model.updated_at = datetime.now(timezone.utc)
     if session is not None:
         session.add(model)

@@ -59,10 +59,21 @@ const STATUS_COLORS: Record<string, string> = {
   subscribed: 'success',
   expired: 'warning',
   invalid: 'error',
+  // 被 OpenAI 删除/停用的号单独一档，用更深的红紫和"已失效"区分开
+  deleted: 'volcano',
 }
 
 // 纯前端动作，不发请求，所以不和后端的 action id 抢命名空间
 const COPY_TOTP_ACTION_ID = '__copy_totp_secret'
+
+const BATCH_UPLOAD_ACTIONS = [
+  { id: 'upload_cpa', label: '上传 CPA' },
+  { id: 'upload_sub2api', label: '上传 Sub2API' },
+  { id: 'upload_tm', label: '上传 Team Manager' },
+  { id: 'upload_codex_proxy', label: '上传 CodexProxy' },
+] as const
+
+type BatchUploadActionId = (typeof BATCH_UPLOAD_ACTIONS)[number]['id']
 
 // 这些动作要跑几十秒的协议链（还可能停下来等一封验证码），同步等只能看见一个
 // 转圈。改走后台任务，和注册一样用日志弹窗把每一步显示出来。
@@ -101,6 +112,7 @@ function normalizeAccount(account: any) {
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
   const plusCheck = extra.plus_check && typeof extra.plus_check === 'object' ? extra.plus_check : {}
   const totpSecret = String(extra.totp_secret || '')
+  const smsVerification = extra.sms_verification && typeof extra.sms_verification === 'object' ? extra.sms_verification : {}
   return {
     ...account,
     extra,
@@ -110,7 +122,11 @@ function normalizeAccount(account: any) {
     chatgptLocal,
     plusCheck,
     totpSecret,
+    smsVerification,
+    webPoolOnly: extra.account_purpose === 'chatgpt_web_pool' || ['1', 'true'].includes(String(extra.chatgpt_web_only).toLowerCase()),
+    webPoolSync: syncStatuses.chatgpt2api || {},
   }
+
 }
 
 function formatSyncTime(value?: string) {
@@ -343,6 +359,9 @@ function cliproxyStateMeta(sync: any) {
   }
   if (!sync.uploaded) {
     return { color: 'default', label: '未发现' }
+  }
+  if (sync.remote_state === 'relogin_required') {
+    return { color: 'warning', label: '需重新登录' }
   }
   if (sync.remote_state === 'usable') {
     return { color: 'success', label: '远端可用' }
@@ -733,6 +752,7 @@ export default function Accounts() {
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [filterPlusStatus, setFilterPlusStatus] = useState('')
+  const [filterSmsVerified, setFilterSmsVerified] = useState('')
   const [createdAtStart, setCreatedAtStart] = useState('')
   const [createdAtEnd, setCreatedAtEnd] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
@@ -757,7 +777,7 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
-  const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
+  const [batchUploadLoading, setBatchUploadLoading] = useState<'' | `${BatchUploadActionId}_${'all' | 'selected'}`>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<
     'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | 'plus_selected' | 'plus_all' | ''
   >('')
@@ -792,6 +812,7 @@ export default function Accounts() {
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (filterPlusStatus) params.set('plus_status', filterPlusStatus)
+      if (filterSmsVerified) params.set('sms_verified', filterSmsVerified)
       if (createdAtStart) params.set('created_at_start', createdAtStart)
       if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
@@ -800,7 +821,7 @@ export default function Accounts() {
     } finally {
       setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus, filterPlusStatus, createdAtStart, createdAtEnd, page, pageSize])
+  }, [currentPlatform, search, filterStatus, filterPlusStatus, filterSmsVerified, createdAtStart, createdAtEnd, page, pageSize])
 
   useEffect(() => {
     load()
@@ -1044,6 +1065,7 @@ export default function Accounts() {
       if (search) body.email = search
       if (filterStatus) body.status = filterStatus
       if (filterPlusStatus) body.plus_status = filterPlusStatus
+      if (filterSmsVerified) body.sms_verified = filterSmsVerified
     }
 
     setStatusSyncLoading(loadingKey)
@@ -1073,8 +1095,11 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchUploadCpa = async (scope: 'selected' | 'all') => {
-    const toastKey = `batch-upload-cpa:${scope}`
+  const handleBatchUpload = async (actionId: BatchUploadActionId, scope: 'selected' | 'all') => {
+    const action = BATCH_UPLOAD_ACTIONS.find((item) => item.id === actionId)
+    if (!action) return
+
+    const toastKey = `batch-upload:${actionId}:${scope}`
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
 
     const body: Record<string, unknown> = {
@@ -1087,7 +1112,7 @@ export default function Accounts() {
         .filter((value) => Number.isInteger(value) && value > 0)
 
       if (accountIds.length === 0) {
-        message.warning('请先选择要导入 CPA 的账号')
+        message.warning(`请先选择要${action.label}的账号`)
         return
       }
       body.account_ids = accountIds
@@ -1096,12 +1121,13 @@ export default function Accounts() {
       if (search) body.email = search
       if (filterStatus) body.status = filterStatus
       if (filterPlusStatus) body.plus_status = filterPlusStatus
+      if (filterSmsVerified) body.sms_verified = filterSmsVerified
     }
 
-    setCpaUploadLoading(scope)
-    message.loading({ content: `${scopeLabel}导入 CPA 进行中...`, key: toastKey, duration: 0 })
+    setBatchUploadLoading(`${actionId}_${scope}`)
+    message.loading({ content: `${scopeLabel}${action.label}进行中...`, key: toastKey, duration: 0 })
     try {
-      const result = await apiFetch(`/actions/${currentPlatform}/upload_cpa/batch`, {
+      const result = await apiFetch(`/actions/${currentPlatform}/${actionId}/batch`, {
         method: 'POST',
         body: JSON.stringify(body),
       })
@@ -1109,19 +1135,19 @@ export default function Accounts() {
       if (!result.total) {
         message.info({ content: '没有可处理的账号', key: toastKey })
       } else if (!result.failed) {
-        message.success({ content: `${scopeLabel}导入 CPA 完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+        message.success({ content: `${scopeLabel}${action.label}完成：成功 ${result.success} / ${result.total}`, key: toastKey })
       } else if (!result.success) {
-        message.error({ content: `${scopeLabel}导入 CPA 失败：成功 ${result.success} / ${result.total}`, key: toastKey })
+        message.error({ content: `${scopeLabel}${action.label}失败：成功 ${result.success} / ${result.total}`, key: toastKey })
       } else {
-        message.warning({ content: `${scopeLabel}导入 CPA 部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+        message.warning({ content: `${scopeLabel}${action.label}部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
       }
 
-      showBatchActionResult(`${scopeLabel}导入 CPA 结果`, result)
+      showBatchActionResult(`${scopeLabel}${action.label}结果`, result)
       await load()
     } catch (e: any) {
-      message.error({ content: `导入 CPA 失败: ${e.message}`, key: toastKey })
+      message.error({ content: `${action.label}失败: ${e.message}`, key: toastKey })
     } finally {
-      setCpaUploadLoading('')
+      setBatchUploadLoading('')
     }
   }
 
@@ -1147,6 +1173,7 @@ export default function Accounts() {
       if (search) body.email = search
       if (filterStatus) body.status = filterStatus
       if (filterPlusStatus) body.plus_status = filterPlusStatus
+      if (filterSmsVerified) body.sms_verified = filterSmsVerified
     }
 
     setBackfillRtLoading(true)
@@ -1172,16 +1199,13 @@ export default function Accounts() {
 
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
-  const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
-
-  const uploadCpaButtonLabel = () => {
-    const scope = getUploadCpaScope()
-    const count = scope === 'selected' ? selectedRowKeys.length : total
-    return scope === 'selected' ? `导入所选 CPA (${count})` : `导入筛选 CPA (${count})`
-  }
+  const getBatchUploadScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const hasUploadCpaAction = platformActions.some((item) => item?.id === 'upload_cpa')
+  const batchUploadActions = BATCH_UPLOAD_ACTIONS.filter((action) =>
+    platformActions.some((item) => item?.id === action.id),
+  )
   const monospaceStyle: React.CSSProperties = {
     fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
     fontSize: 12,
@@ -1240,6 +1264,7 @@ export default function Accounts() {
           <Text type="secondary" style={secondaryTextStyle} ellipsis={{ tooltip: record.user_id || `账号 #${record.id}` }}>
             {record.user_id ? `UID: ${record.user_id}` : `账号 #${record.id}`}
           </Text>
+          {record.webPoolOnly ? <Tag color="cyan">Web 号池专用 · 免手机接码</Tag> : null}
         </div>
       ),
     },
@@ -1281,15 +1306,44 @@ export default function Accounts() {
       width: 110,
       render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{status}</Tag>,
     },
+    {
+      title: '接码记录',
+      key: 'sms_verification',
+      width: 130,
+      render: (_: unknown, record: any) => record.webPoolOnly ? <Tag color="cyan">Web 池注册（未接码）</Tag> : record.smsVerification?.verified ? (
+        <Tag color="success">已接码{record.smsVerification.country ? ` (${record.smsVerification.country})` : ''}</Tag>
+      ) : <Tag color="default">未知</Tag>,
+    },
   ]
 
   if (isChatgptPlatform) {
     columns.push(
       {
+        title: 'RT 测活',
+        key: 'rt_probe',
+        width: 110,
+        render: (_: unknown, record: any) => {
+          if (record.webPoolOnly) return <Tag color="cyan">Web 池账号</Tag>
+          const state = record.chatgptLocal?.codex?.state
+          if (!state) return <Tag>未测活</Tag>
+          const valid = ['access_token_valid', 'usable'].includes(state)
+          return <Tag color={valid ? 'success' : 'error'}>{valid ? 'RT有效' : 'RT失效'}</Tag>
+        },
+      },
+      {
         title: '本地状态',
         key: 'chatgpt_local_state',
         width: 320,
         render: (_: any, record: any) => {
+          if (record.webPoolOnly) {
+            const sync = record.webPoolSync
+            return <Space direction="vertical" size={2}>
+              <Tag color={sync.ready ? 'success' : sync.imported ? 'warning' : 'default'}>
+                {sync.ready ? 'Web 远端已确认可用' : sync.imported ? '已入 Web 池，未确认可用' : 'Web 账号待上传'}
+              </Tag>
+              <Text type="secondary">{sync.imported ? `上次确认图片额度：${sync.quota ?? '-'}（非实时）` : '由 Web 号池巡检补传，不参与 Codex／RT 巡检'}</Text>
+            </Space>
+          }
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
           const codex = record.chatgptLocal?.codex || {}
@@ -1469,6 +1523,14 @@ export default function Accounts() {
     },
   ]
 
+  const batchUploadScope = getBatchUploadScope()
+  const batchUploadCount = batchUploadScope === 'selected' ? selectedRowKeys.length : total
+  const batchUploadMenuItems: MenuProps['items'] = batchUploadActions.map((action) => ({
+    key: action.id,
+    label: action.label,
+    disabled: batchUploadCount === 0 || batchUploadLoading !== '',
+  }))
+
   return (
     <div>
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
@@ -1490,6 +1552,7 @@ export default function Accounts() {
               { value: 'subscribed', label: '已订阅' },
               { value: 'expired', label: '已过期' },
               { value: 'invalid', label: '已失效' },
+              { value: 'deleted', label: '已删除/停用' },
             ]}
           />
           {currentPlatform === 'chatgpt' && (
@@ -1501,6 +1564,16 @@ export default function Accounts() {
               options={PLUS_TRIAL_FILTERS}
             />
           )}
+          <Select
+            placeholder="是否接过码"
+            allowClear
+            style={{ width: 130 }}
+            onChange={(v) => { setPage(1); setFilterSmsVerified(v || '') }}
+            options={[
+              { value: 'true', label: '已接过码' },
+              { value: 'false', label: '未接过码' },
+            ]}
+          />
           <DatePicker
             showTime
             allowClear
@@ -1543,6 +1616,17 @@ export default function Accounts() {
             </Dropdown>
           )}
           {currentPlatform === 'chatgpt' && (
+            // 备注：把常用的 RT 测活直接露出，范围沿用当前勾选或筛选结果。
+            <Button
+              icon={<SyncOutlined />}
+              loading={statusSyncLoading === `probe_${getStatusSyncScope()}`}
+              disabled={total === 0}
+              onClick={() => handleBatchStatusSync('probe', getStatusSyncScope())}
+            >
+              RT 测活
+            </Button>
+          )}
+          {currentPlatform === 'chatgpt' && (
             <Button
               icon={<KeyOutlined />}
               onClick={() => setBackfillRtModalOpen(true)}
@@ -1551,23 +1635,51 @@ export default function Accounts() {
               {selectedRowKeys.length > 0 ? `补 RT (${selectedRowKeys.length})` : '补 RT'}
             </Button>
           )}
-          {currentPlatform !== 'chatgpt' && hasUploadCpaAction && (
+          {isChatgptPlatform && batchUploadMenuItems.length > 0 && (
+            <Dropdown
+              trigger={['click']}
+              menu={{
+                items: batchUploadMenuItems,
+                onClick: ({ key }) => {
+                  const action = BATCH_UPLOAD_ACTIONS.find((item) => item.id === key)
+                  if (!action) return
+                  const scopeLabel = batchUploadScope === 'selected' ? `所选 ${batchUploadCount} 个账号` : `当前筛选 ${batchUploadCount} 个账号`
+                  Modal.confirm({
+                    title: `确认${scopeLabel}${action.label}？`,
+                    content: '批量操作将逐个执行，并在完成后显示失败明细。',
+                    okText: '确认',
+                    cancelText: '取消',
+                    onOk: () => handleBatchUpload(action.id, batchUploadScope),
+                  })
+                },
+              }}
+            >
+              <Button
+                icon={<UploadOutlined />}
+                loading={batchUploadLoading !== ''}
+                disabled={batchUploadCount === 0}
+              >
+                {batchUploadScope === 'selected' ? `上传 (${batchUploadCount})` : '上传'}
+              </Button>
+            </Dropdown>
+          )}
+          {!isChatgptPlatform && hasUploadCpaAction && (
             <Popconfirm
               title={
-                getUploadCpaScope() === 'selected'
-                  ? `确认导入所选 ${selectedRowKeys.length} 个账号到 CPA？`
-                  : `确认导入当前筛选范围内 ${total} 个账号到 CPA？`
+                getBatchUploadScope() === 'selected'
+                  ? `确认上传所选 ${selectedRowKeys.length} 个账号到 CPA？`
+                  : `确认上传当前筛选范围内 ${total} 个账号到 CPA？`
               }
-              onConfirm={() => handleBatchUploadCpa(getUploadCpaScope())}
+              onConfirm={() => handleBatchUpload('upload_cpa', getBatchUploadScope())}
               okText="确认"
               cancelText="取消"
             >
               <Button
-                loading={cpaUploadLoading === 'selected' || cpaUploadLoading === 'all'}
+                loading={batchUploadLoading === 'upload_cpa_selected' || batchUploadLoading === 'upload_cpa_all'}
                 icon={<UploadOutlined />}
-                disabled={getUploadCpaScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
+                disabled={getBatchUploadScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
               >
-                {uploadCpaButtonLabel()}
+                {getBatchUploadScope() === 'selected' ? `上传所选 CPA (${selectedRowKeys.length})` : `上传筛选 CPA (${total})`}
               </Button>
             </Popconfirm>
           )}
@@ -1781,6 +1893,7 @@ export default function Accounts() {
           email: search,
           status: filterStatus,
           plus_status: filterPlusStatus,
+          sms_verified: filterSmsVerified,
           created_at_start: createdAtStart,
           created_at_end: createdAtEnd,
         }}
@@ -1833,6 +1946,7 @@ export default function Accounts() {
                     { value: 'subscribed', label: '已订阅' },
                     { value: 'expired', label: '已过期' },
                     { value: 'invalid', label: '已失效' },
+                    { value: 'deleted', label: '已删除/停用' },
                   ]}
                 />
               </Form.Item>

@@ -13,8 +13,8 @@ RUN npm run build
 
 FROM python:3.12-slim AS runtime
 
-ARG CAMOUFOX_VERSION=135.0.1
-ARG CAMOUFOX_RELEASE=beta.24
+ARG CAMOUFOX_VERSION=152.0.4
+ARG CAMOUFOX_RELEASE=beta.30
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -25,11 +25,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_RELOAD=0 \
     APP_RUNTIME_DIR=/runtime \
     CREDENTIAL_ENCRYPTION_KEY_FILE=/runtime/.secrets/credential_key \
-    APP_ENABLE_SOLVER=1 \
+    APP_ENABLE_SOLVER=0 \
     SOLVER_PORT=8889 \
     SOLVER_BIND_HOST=0.0.0.0 \
     LOCAL_SOLVER_URL=http://127.0.0.1:8889 \
-    SOLVER_BROWSER_TYPE=camoufox
+    SOLVER_BROWSER_TYPE=camoufox \
+    SOLVER_THREADS=1
 
 WORKDIR /app
 
@@ -65,11 +66,10 @@ RUN pip install --upgrade pip \
 COPY . .
 COPY --from=frontend-builder /app/static /app/static
 
-RUN apt-get update && apt-get install -y --no-install-recommends dos2unix git iproute2 procps \
-    && dos2unix /app/docker/entrypoint.sh \
+# 运行时不需要额外工具包；基础镜像已有 sed/chmod，避免在小磁盘服务器上重复安装 100MB 级依赖。
+RUN sed -i 's/\r$//' /app/docker/entrypoint.sh \
     && chmod +x /app/docker/entrypoint.sh \
-    && mkdir -p /runtime /runtime/logs /_ext_targets \
-    && rm -rf /var/lib/apt/lists/*
+    && mkdir -p /runtime /runtime/logs /_ext_targets
 
 EXPOSE 8000 8889
 

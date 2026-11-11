@@ -6,26 +6,39 @@ from .registry import get, load_all
 from .base_platform import Account, AccountStatus, RegisterConfig
 import threading
 import time
+import os
 
 
 class Scheduler:
     def __init__(self):
         self._running = False
         self._thread: threading.Thread = None
+        self._wake_event = threading.Event()
         self._loop_interval_seconds = 60
         self._trial_check_interval_seconds = 3600
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
+        self._last_inspection_at = 0.0
+        self._last_sms_stock_at = 0.0
+        self._last_web_pool_at = 0.0
 
     def start(self):
+        if os.getenv("APP_ENABLE_SCHEDULER", "1").lower() in {"0", "false", "no", "off"}:
+            print("[Scheduler] 当前为维护/预检模式，未启动自动任务")
+            return
         if self._running:
             return
         self._running = True
         
         now = time.time()
-        # 将上次执行时间设为当前时间，避免应用一启动就瞬间触发定时任务（如 CPA 自动注册）
+        # 将其他维护任务设为当前时间，避免应用一启动就瞬间触发定时任务。
+        # 巡检若已开启则允许启动后立即执行；通过界面新开启时也会主动唤醒调度器。
         self._last_trial_check_at = now
         self._last_cpa_maintenance_at = now
+        self._last_inspection_at = 0.0
+        self._last_sms_stock_at = now
+        self._last_web_pool_at = now
+        self._wake_event.clear()
 
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -33,31 +46,117 @@ class Scheduler:
 
     def stop(self):
         self._running = False
+        self._wake_event.set()
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=10)
+
+    def trigger_inspection_now(self) -> None:
+        """让已开启的自动巡检立即重新计算并唤醒调度线程。"""
+        self._last_inspection_at = 0.0
+        self._wake_event.set()
+
+    def trigger_sms_stock_now(self) -> None:
+        self._last_sms_stock_at = 0.0
+        self._wake_event.set()
+
+    def trigger_web_pool_now(self) -> None:
+        self._last_web_pool_at = 0.0
+        self._wake_event.set()
+
+    def _get_web_pool_interval_seconds(self) -> int:
+        from services.chatgpt_web_pool import WebPoolSettings
+
+        settings = WebPoolSettings.from_store()
+        return settings.interval_minutes * 60 if settings.enabled else 0
+
+    def run_web_pool(self):
+        from api.chatgpt_web_pool import enqueue
+
+        return enqueue(trigger="schedule")
+
+    def _get_sms_stock_interval_seconds(self) -> int:
+        from services.sms_stock_service import SmsStockSettings
+
+        settings = SmsStockSettings.from_store()
+        return settings.interval_minutes * 60 if settings.enabled else 0
+
+    def run_sms_stock(self):
+        from api.sms_stock import enqueue
+
+        return enqueue(trigger="schedule")
 
     def _loop(self):
         while self._running:
             now = time.time()
-            if now - self._last_trial_check_at >= self._trial_check_interval_seconds:
-                try:
-                    self.check_trial_expiry()
-                    self._last_trial_check_at = now
-                except Exception as e:
-                    print(f"[Scheduler] Trial 检查错误: {e}")
+            try:
+                if now - self._last_trial_check_at >= self._trial_check_interval_seconds:
+                    try:
+                        self.check_trial_expiry()
+                        self._last_trial_check_at = now
+                    except Exception as e:
+                        print(f"[Scheduler] Trial 检查错误: {e}")
 
-            cpa_interval = self._get_cpa_maintenance_interval_seconds()
-            if cpa_interval and now - self._last_cpa_maintenance_at >= cpa_interval:
-                try:
-                    self.check_cpa_credentials()
-                    self._last_cpa_maintenance_at = now
-                except Exception as e:
-                    print(f"[Scheduler] CPA 维护错误: {e}")
+                cpa_interval = self._get_cpa_maintenance_interval_seconds()
+                if cpa_interval and now - self._last_cpa_maintenance_at >= cpa_interval:
+                    try:
+                        self.check_cpa_credentials()
+                        self._last_cpa_maintenance_at = now
+                    except Exception as e:
+                        print(f"[Scheduler] CPA 维护错误: {e}")
 
-            time.sleep(self._loop_interval_seconds)
+                inspection_interval = self._get_inspection_interval_seconds()
+                if inspection_interval and now - self._last_inspection_at >= inspection_interval:
+                    try:
+                        result = self.run_inspection()
+                        # 无匹配账号或已有任务时也更新时间，避免每分钟重复尝试。
+                        self._last_inspection_at = now
+                        if result:
+                            print(f"[Scheduler] 已创建自动巡检任务: {result.get('task_id', '')}")
+                        else:
+                            print("[Scheduler] 自动巡检本轮跳过：无匹配账号或已有任务")
+                    except Exception as e:
+                        # 单次调度失败不能杀死后台线程，下一轮继续重试。
+                        print(f"[Scheduler] 巡检错误: {e}")
+                stock_interval = self._get_sms_stock_interval_seconds()
+                if stock_interval and now - self._last_sms_stock_at >= stock_interval:
+                    self._last_sms_stock_at = now
+                    try:
+                        result = self.run_sms_stock()
+                        print(f"[Scheduler] 接码补库: {result.get('task_id') or result.get('reason')}")
+                    except Exception as e:
+                        print(f"[Scheduler] 接码补库错误: {type(e).__name__}")
+                web_interval = self._get_web_pool_interval_seconds()
+                if web_interval and now - self._last_web_pool_at >= web_interval:
+                    self._last_web_pool_at = now
+                    try:
+                        result = self.run_web_pool()
+                        print(f"[Scheduler] Web 号池: {result.get('task_id') or result.get('reason')}")
+                    except Exception as e:
+                        print(f"[Scheduler] Web 号池错误: {type(e).__name__}")
+            except Exception as e:
+                # 配置/数据库异常也不能让调度线程静默退出。
+                print(f"[Scheduler] 调度循环错误: {e}")
+
+            self._wake_event.wait(self._loop_interval_seconds)
+            self._wake_event.clear()
 
     def _get_cpa_maintenance_interval_seconds(self) -> int:
         from services.cpa_manager import get_cpa_maintenance_interval_seconds
 
         return get_cpa_maintenance_interval_seconds()
+
+    def _get_inspection_interval_seconds(self) -> int:
+        from services.inspection_service import InspectionSettings
+
+        settings = InspectionSettings.from_store()
+        if not settings.enabled:
+            return 0
+        return max(60, int(settings.interval_minutes * 60))
+
+    def run_inspection(self):
+        from api.inspection import enqueue_scheduled_inspection
+
+        return enqueue_scheduled_inspection()
 
     def check_trial_expiry(self):
         """检查 trial 到期账号，更新状态"""

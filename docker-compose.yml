@@ -4,24 +4,48 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-135.0.1}
-        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.24}
+        CAMOUFOX_VERSION: ${CAMOUFOX_VERSION:-152.0.4}
+        CAMOUFOX_RELEASE: ${CAMOUFOX_RELEASE:-beta.30}
     container_name: any-auto-register
     init: true
     restart: unless-stopped
+    stop_grace_period: 120s
+    # 限制容器可用资源，避免影响宿主机；OOM不保证主进程退出，不能代替健康检查。
+    mem_limit: ${APP_MEM_LIMIT:-2g}
+    memswap_limit: ${APP_MEM_SWAP_LIMIT:-3g}
+    cpus: ${APP_CPU_LIMIT:-2.0}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${APP_LOG_MAX_SIZE:-10m}
+        max-file: "${APP_LOG_MAX_FILES:-3}"
     environment:
       HOST: 0.0.0.0
       PORT: "8000"
       APP_RELOAD: "0"
       APP_CONDA_ENV: docker
       APP_RUNTIME_DIR: /runtime
+      APP_TASK_WORKERS: ${APP_TASK_WORKERS:-1}
+      APP_MAX_ACTIVE_TASKS: ${APP_MAX_ACTIVE_TASKS:-4}
+      APP_UPLOAD_WORKERS: ${APP_UPLOAD_WORKERS:-1}
+      APP_UPLOAD_QUEUE_SIZE: ${APP_UPLOAD_QUEUE_SIZE:-16}
+      APP_TASK_LOG_TAIL_LINES: ${APP_TASK_LOG_TAIL_LINES:-2000}
+      APP_TASK_LOG_TAIL_BYTES: ${APP_TASK_LOG_TAIL_BYTES:-1048576}
       # 必须落在挂载卷里，否则每次重建容器都会换密钥，库里的凭据全部作废
       CREDENTIAL_ENCRYPTION_KEY_FILE: /runtime/.secrets/credential_key
-      APP_ENABLE_SOLVER: "1"
+      # 纯协议运行推荐 docker-compose.server.yml；需要浏览器时显式设为 1。
+      APP_ENABLE_SOLVER: ${APP_ENABLE_SOLVER:-0}
       SOLVER_PORT: "8889"
       SOLVER_BIND_HOST: 0.0.0.0
       LOCAL_SOLVER_URL: http://127.0.0.1:8889
       SOLVER_BROWSER_TYPE: ${SOLVER_BROWSER_TYPE:-camoufox}
+      # 显式启用时也默认只保留 1 个浏览器；每个约 300–500MB。
+      SOLVER_THREADS: ${SOLVER_THREADS:-1}
+      SOLVER_QUEUE_LIMIT: ${SOLVER_QUEUE_LIMIT:-2}
+      SOLVER_QUEUE_TIMEOUT_SECONDS: ${SOLVER_QUEUE_TIMEOUT_SECONDS:-15}
+      SOLVER_TASK_TIMEOUT_SECONDS: ${SOLVER_TASK_TIMEOUT_SECONDS:-90}
+      SOLVER_RESULT_TTL_SECONDS: ${SOLVER_RESULT_TTL_SECONDS:-900}
+      SOLVER_RESULT_MAX_ENTRIES: ${SOLVER_RESULT_MAX_ENTRIES:-1000}
       PLAYWRIGHT_HEADLESS: ${PLAYWRIGHT_HEADLESS:-}
     ports:
       - "8000:8000"

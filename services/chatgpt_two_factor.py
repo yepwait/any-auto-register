@@ -49,6 +49,7 @@ def select_two_factor_targets(
     email: str = "",
     status: str = "",
     plus_status: str = "",
+    sms_verified: str = "",
     only_missing_2fa: bool = True,
 ) -> tuple[list[AccountModel], list[int]]:
     """挑出要绑 2FA 的号，返回 ``(账号列表, 找不到的 id)``。
@@ -63,6 +64,7 @@ def select_two_factor_targets(
         email=email,
         status=status,
         plus_status=plus_status,
+        sms_verified=sms_verified,
         keep=account_missing_two_factor if only_missing_2fa else None,
     )
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from platforms.chatgpt.protocol.mail_provider import MailProvider
@@ -821,6 +822,14 @@ class PhoneRegisterMixin:
                 self._extract_continue_url_from_step(validate_resp)
             )
             next_page = self._extract_page_type(validate_resp)
+            # 收到短信不代表验证通过；只有 validate 成功后才写入库存凭据。
+            activation = getattr(ctrl, "activation", None)
+            self.result.sms_verification = {
+                "used": True,
+                "verified": True,
+                "country": str(getattr(activation, "country", "") or ""),
+                "at": datetime.now(timezone.utc).isoformat(),
+            }
             logger.info(
                 "[手机注册] ✅ 手机号 %s 验证通过，服务端下一步 page=%s continue=%s",
                 phone,

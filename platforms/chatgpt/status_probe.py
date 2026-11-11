@@ -385,6 +385,34 @@ def probe_plus_trial_status(account: Any, proxy: Optional[str] = None) -> dict[s
     return verdict
 
 
+def _sync_refreshed_credentials(account: Any, access_token: str, refresh_token: str = "") -> None:
+    """把探测过程中换到的新凭证同步回本次调用使用的快照。
+
+    探测函数本身不直接持有数据库连接，但巡检会在探测后重新读取账号并上传。
+    因此必须把轮换后的 AT/RT 写回 duck-typed 快照，调用方才能在网络请求结束后
+    将它们安全地落库；这里不把凭证放进 probe 返回值，避免状态接口/日志意外回显。
+    """
+    access_token = str(access_token or "").strip()
+    refresh_token = str(refresh_token or "").strip()
+    if access_token:
+        for attr in ("access_token", "token"):
+            try:
+                setattr(account, attr, access_token)
+            except Exception:
+                pass
+    if refresh_token:
+        try:
+            setattr(account, "refresh_token", refresh_token)
+        except Exception:
+            pass
+    extra = getattr(account, "extra", None)
+    if isinstance(extra, dict):
+        if access_token:
+            extra["access_token"] = access_token
+        if refresh_token:
+            extra["refresh_token"] = refresh_token
+
+
 def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dict[str, Any]:
     checked_at = _utcnow_iso()
     extra = getattr(account, "extra", {}) or {}
@@ -429,7 +457,7 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         },
     }
 
-    if not access_token:
+    if not access_token and not (refresh_token or session_token):
         result["auth"].update(
             {
                 "state": "missing_access_token",
@@ -444,7 +472,54 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         )
         return result
 
-    me_result = _probe_backend_me(access_token, proxy=proxy)
+    me_result = (
+        _probe_backend_me(access_token, proxy=proxy)
+        if access_token
+        else ProbeHTTPResult(401, {}, "", {}, "", "账号缺少 access_token")
+    )
+    # Session 失效不代表 OAuth RT 失效；两种方式各尝试一次，并校验新 AT。
+    # 记录策略/结果而不记录凭证，避免刷新失败被静默吞掉。
+    if (
+        me_result.status_code == 401
+        and (refresh_token or session_token)
+        and not is_account_deactivated_message(me_result.error_code, me_result.message)
+    ):
+        from platforms.chatgpt.token_refresh import TokenRefreshManager
+
+        manager = TokenRefreshManager(proxy_url=proxy)
+        client_id = str(extra.get("client_id") or getattr(account, "client_id", "") or "").strip()
+        attempts: list[dict[str, Any]] = []
+        strategies = []
+        if session_token:
+            strategies.append(("session", lambda: manager.refresh_by_session_token(session_token)))
+        if refresh_token:
+            strategies.append(("oauth", lambda: manager.refresh_by_oauth_token(refresh_token, client_id=client_id or None)))
+        for strategy, refresh in strategies:
+            try:
+                refreshed = refresh()
+                entry = {"strategy": strategy, "ok": bool(refreshed.success and refreshed.access_token)}
+                attempts.append(entry)
+                if not entry["ok"]:
+                    entry["error"] = "refresh_rejected"
+                    continue
+                access_token = refreshed.access_token
+                refresh_token = refreshed.refresh_token or refresh_token
+                _sync_refreshed_credentials(account, access_token, refresh_token)
+                me_result = _probe_backend_me(access_token, proxy=proxy)
+                entry["http_status"] = me_result.status_code
+                if me_result.status_code != 401:
+                    break
+            except Exception as exc:
+                attempts.append({"strategy": strategy, "ok": False, "error": type(exc).__name__})
+        result["auth"]["refresh_attempts"] = attempts
+    # 刷新可能带来新的 AT/ID token，账号 ID 必须按最新凭证重新解析，
+    # 否则“原账号没有 ID、刷新后新 AT 带 ID”会被误判成缺少 Chatgpt-Account-Id。
+    if access_token:
+        refreshed_account_id = extract_chatgpt_account_id(account)
+        if refreshed_account_id and refreshed_account_id != account_id:
+            account_id = refreshed_account_id
+            result["subscription"]["chatgpt_account_id"] = refreshed_account_id
+            result["codex"]["chatgpt_account_id"] = refreshed_account_id
     result["auth"].update(
         {
             "http_status": me_result.status_code,
@@ -499,19 +574,24 @@ def probe_local_chatgpt_status(account: Any, proxy: Optional[str] = None) -> dic
         )
         if codex_result.status_code == 200:
             result["codex"]["state"] = "usable"
+        elif is_account_deactivated_message(codex_result.error_code, codex_result.message):
+            result["codex"]["state"] = "account_deactivated"
         elif codex_result.status_code == 401:
             if codex_result.error_code == "token_invalidated":
                 result["codex"]["state"] = "access_token_invalidated"
             else:
                 result["codex"]["state"] = "unauthorized"
-        elif is_account_deactivated_message(codex_result.error_code, codex_result.message):
-            result["codex"]["state"] = "account_deactivated"
         elif codex_result.status_code in (402, 403):
             result["codex"]["state"] = "payment_required"
         elif codex_result.status_code == 429:
             result["codex"]["state"] = "quota_exhausted"
         else:
             result["codex"]["state"] = "probe_failed"
+        return result
+
+    if is_account_deactivated_message(me_result.error_code, me_result.message):
+        result["auth"]["state"] = "account_deactivated"
+        result["codex"].update({"state": "skipped_auth_invalid", "message": "账号已明确删除或停用"})
         return result
 
     if me_result.status_code == 401:

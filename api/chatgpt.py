@@ -76,6 +76,8 @@ def refresh_token(account_id: int, proxy: Optional[str] = None,
             extra["refresh_token"] = result.refresh_token
         acc.set_extra(extra)
         acc.token = result.access_token
+        # 备注：刷新成功已拿到新 AT，主状态不能继续保留旧的 invalid。
+        acc.status = "registered"
         from datetime import datetime
         acc.updated_at = datetime.utcnow()
         session.add(acc)
