@@ -99,7 +99,7 @@ def test_config_default_off_and_secret_not_public():
     {"base_url": "file:///tmp/key"}, {"base_url": "https://user:secret@pool.test"},
     {"base_url": "https://pool.test?key=secret"}, {"base_url": "https://pool.test/api/accounts"},
     {"admin_token": "key\nother"}, {"target_value": 0}, {"interval_minutes": 0},
-    {"max_attempts_per_run": 0}, {"daily_registration_limit": -1}, {"target_mode": "codex"},
+    {"max_attempts_per_run": -1}, {"max_consecutive_failures": -1}, {"daily_registration_limit": -1}, {"target_mode": "codex"},
     {"delay_seconds": float("inf")},
 ])
 def test_invalid_settings_rejected(change):

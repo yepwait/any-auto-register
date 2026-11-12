@@ -435,7 +435,7 @@ def _list_persisted_tasks(*, source: str | None = None, status: str | None = Non
         data["updated_at"] = _to_epoch_seconds(data["updated_at"])
         if _task_store.exists(data["id"]):
             live = _task_store.snapshot(data["id"], include_logs=False)
-            live["error_count"] = len(live.get("errors") or [])
+            live["error_count"] = max(int(live.get("error_count") or 0), len(live.get("errors") or []))
             live["errors"] = []
             data.update(live)
         snapshots.append(data)

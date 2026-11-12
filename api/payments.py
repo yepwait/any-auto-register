@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
-import time
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -12,10 +13,13 @@ from sqlmodel import Session
 
 from core.db import AccountModel, engine, get_session
 from core.config_store import config_store
+from core.resource_limits import account_slot
+from services.payment_channels.contracts import PaymentAccount
 from services.payment_channels.registry import load_builtin_payment_channels, payment_channels
-from services.payment_channels.service import account_context, create_link, create_link_for_context, pay, pay_for_context
+from services.payment_channels.service import account_context, create_link_for_context, pay_for_context
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+logger = logging.getLogger(__name__)
 
 
 class PaymentRequest(BaseModel):
@@ -47,6 +51,18 @@ def _account(account_id: int, session: Session) -> AccountModel:
     if not account or account.platform != "chatgpt":
         raise HTTPException(404, "账号不存在")
     return account
+
+
+def _account_snapshot(account_id: int, session: Session | None = None) -> PaymentAccount:
+    # Keep explicit-session Python callers working, but release their read
+    # transaction before waiting for a worker slot or making network requests.
+    if session is not None:
+        try:
+            return account_context(_account(account_id, session))
+        finally:
+            session.close()
+    with Session(engine) as read_session:
+        return account_context(_account(account_id, read_session))
 
 
 def _configured_payment_proxy(operation: str, options: dict[str, Any]) -> str | None:
@@ -164,6 +180,37 @@ def _safe_result(result: Any, email: str, account_id: int) -> dict[str, Any]:
     }
 
 
+def _fail_payment_task(task_id: str, error: str) -> None:
+    """Release admission before best-effort persistence, retaining task history."""
+    from api import tasks
+
+    snapshot = tasks._task_store.snapshot(task_id)
+    if snapshot["status"] in {"pending", "running"}:
+        tasks._task_store.finish(
+            task_id,
+            status="failed",
+            success=snapshot["success"],
+            registered=snapshot["registered"],
+            skipped=snapshot["skipped"],
+            errors=snapshot["errors"],
+            error=error,
+        )
+    try:
+        tasks._log(task_id, f"[FAIL] {error}")
+    except Exception:
+        logger.exception("Could not log payment task failure: %s", task_id)
+    try:
+        tasks._persist_task_snapshot(task_id)
+    except Exception:
+        # The normal writer can retry a temporary database failure. Do not
+        # clean up the in-memory record until its terminal state is durable.
+        with tasks._log_io_lock:
+            tasks._dirty_task_ids.add(task_id)
+        logger.exception("Could not persist payment task failure: %s", task_id)
+    else:
+        tasks._task_store.cleanup()
+
+
 def _run_payment_task(
     task_id: str,
     account_ids: list[int],
@@ -196,15 +243,20 @@ def _run_payment_task(
         _log(task_id, f"[FAIL] {fields['email']} {result.error or '支付失败'}")
         return AttemptResult.failed(result.error or "支付失败")
 
-    _run_account_batch_task(
-        task_id,
-        account_ids,
-        label=f"{channel} {'提链' if operation == 'link' else '支付'}",
-        concurrency=concurrency,
-        delay_seconds=delay_seconds,
-        proxy=proxy,
-        handle_account=handle_account,
-    )
+    try:
+        _run_account_batch_task(
+            task_id,
+            account_ids,
+            label=f"{channel} {'提链' if operation == 'link' else '支付'}",
+            concurrency=concurrency,
+            delay_seconds=delay_seconds,
+            proxy=proxy,
+            handle_account=handle_account,
+        )
+    except Exception as exc:
+        # Scheduler setup/final persistence can fail outside its own worker
+        # exception handler; never leave an accepted payment pending forever.
+        _fail_payment_task(task_id, f"支付任务执行异常: {exc}")
 
 
 @router.post("/jobs")
@@ -213,51 +265,76 @@ def create_payment_task(request: PaymentTaskRequest, background_tasks: Backgroun
     if operation not in {"link", "pay"}:
         raise HTTPException(400, "operation 必须是 link 或 pay")
     _require_channel(request.channel)
-    account_ids: list[int] = []
-    for account_id in request.account_ids:
-        _account(account_id, session)
-        account_ids.append(int(account_id))
-    task_id = f"payment_{operation}_{int(time.time() * 1000)}"
-    from api.tasks import _log, _persist_task_snapshot, _task_store
-
-    _task_store.create(
-        task_id,
-        platform="chatgpt",
-        total=len(account_ids),
-        source="payment",
-        meta={
-            "kind": "payment",
-            "operation": operation,
-            "channel": request.channel,
-            "account_ids": account_ids,
-            "options": {k: v for k, v in request.options.items() if k not in {"card", "number", "cvc"}},
-            "results": [],
-        },
-    )
-    _persist_task_snapshot(task_id)
-    _log(task_id, f"待处理账号 {len(account_ids)} 个")
+    account_ids = list(dict.fromkeys(int(account_id) for account_id in request.account_ids))
+    try:
+        for account_id in account_ids:
+            _account(account_id, session)
+    finally:
+        # Yield dependencies may otherwise retain their connection through the
+        # response's background work on some FastAPI versions.
+        session.close()
     task_proxy = _configured_payment_proxy(operation, request.options)
-    background_tasks.add_task(
-        _run_payment_task,
-        task_id,
-        account_ids,
-        operation,
-        request.channel,
-        dict(request.options),
-        request.concurrency,
-        request.delay_seconds,
-        proxy=task_proxy,
-    )
+    task_id = f"payment_{operation}_{uuid4().hex}"
+    from api import tasks
+
+    with tasks.chatgpt_enqueue_lock:
+        tasks.ensure_task_capacity()
+        tasks._task_store.create(
+            task_id,
+            platform="chatgpt",
+            total=len(account_ids),
+            source="payment",
+            meta={
+                "kind": "payment",
+                "operation": operation,
+                "channel": request.channel,
+                "account_ids": account_ids,
+                "options": {k: v for k, v in request.options.items() if k not in {"card", "number", "cvc"}},
+                "results": [],
+            },
+        )
+        try:
+            tasks._persist_task_snapshot(task_id)
+            tasks._log(task_id, f"待处理账号 {len(account_ids)} 个")
+            background_tasks.add_task(
+                _run_payment_task,
+                task_id,
+                account_ids,
+                operation,
+                request.channel,
+                dict(request.options),
+                request.concurrency,
+                request.delay_seconds,
+                proxy=task_proxy,
+            )
+        except Exception as exc:
+            _fail_payment_task(task_id, f"支付任务调度失败: {exc}")
+            raise HTTPException(
+                500,
+                {"message": "支付任务调度失败", "task_id": task_id},
+            ) from exc
     return {"task_id": task_id, "total": len(account_ids)}
 
 
-@router.post("/{account_id}/link")
-def create_payment_link(account_id: int, request: PaymentRequest, session: Session = Depends(get_session)):
-    result = create_link(_account(account_id, session), request.channel, options=request.options)
+def create_payment_link(account_id: int, request: PaymentRequest, session: Session | None = None):
+    context = _account_snapshot(account_id, session)
+    with account_slot():
+        result = create_link_for_context(context, request.channel, options=request.options)
     return result.as_dict()
 
 
-@router.post("/{account_id}/pay")
-def execute_payment(account_id: int, request: PaymentRequest, session: Session = Depends(get_session)):
-    result = pay(_account(account_id, session), request.channel, options=request.options)
+@router.post("/{account_id}/link", name="create_payment_link")
+def _create_payment_link_endpoint(account_id: int, request: PaymentRequest):
+    return create_payment_link(account_id, request)
+
+
+def execute_payment(account_id: int, request: PaymentRequest, session: Session | None = None):
+    context = _account_snapshot(account_id, session)
+    with account_slot():
+        result = pay_for_context(context, request.channel, options=request.options)
     return result.as_dict()
+
+
+@router.post("/{account_id}/pay", name="execute_payment")
+def _execute_payment_endpoint(account_id: int, request: PaymentRequest):
+    return execute_payment(account_id, request)

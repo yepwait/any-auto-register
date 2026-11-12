@@ -1,14 +1,15 @@
 import { useCallback, useState } from 'react'
 import {
-  Alert, App, Badge, Button, Card, Col, Descriptions, Drawer, Form,
-  InputNumber, Row, Select, Space, Spin, Statistic, Switch, Table, Tag, Typography,
+  Alert, App, Badge, Button, Card, Col, Collapse, Descriptions, Drawer, Form,
+  InputNumber, Row, Select, Space, Spin, Switch, Table, Tag, Tooltip, Typography,
 } from 'antd'
 import { PlayCircleOutlined, ReloadOutlined, SaveOutlined } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { AdminPageHeader, MetricCard } from '@/components/admin/AdminPage'
 import { usePollingRequest } from '@/hooks/usePollingRequest'
 
-const { Title, Paragraph, Text } = Typography
+const { Paragraph, Text } = Typography
 
 type StockConfig = {
   enabled: boolean
@@ -31,6 +32,7 @@ type StockTask = {
   skipped: number
   errors?: string[]
   error_count?: number
+  created_at?: number | string | null
   meta?: { reason?: string; phase?: string }
 }
 
@@ -55,6 +57,22 @@ const DEFAULTS: StockConfig = {
   register_flow: 'phone_with_email',
 }
 
+const ADVANCED_FIELDS: Partial<Record<keyof StockConfig, string>> = {
+  max_attempts_per_run: 'limits',
+  daily_attempt_limit: 'limits',
+  max_consecutive_failures: 'limits',
+  delay_seconds: 'rate',
+  candidate_cooldown_minutes: 'rate',
+  allow_login: 'recovery',
+  register_flow: 'recovery',
+}
+
+type ValidationFailure = { errorFields: { name: (string | number)[] }[] }
+
+function isValidationFailure(error: unknown): error is ValidationFailure {
+  return Boolean(error && typeof error === 'object' && 'errorFields' in error && Array.isArray(error.errorFields))
+}
+
 function taskStatus(value: string) {
   const labels: Record<string, [string, string]> = {
     pending: ['default', '等待中'], running: ['processing', '运行中'],
@@ -62,6 +80,28 @@ function taskStatus(value: string) {
   }
   const [color, label] = labels[value] || ['default', value]
   return <Tag color={color}>{label}</Tag>
+}
+
+function formatTime(value: StockTask['created_at']) {
+  if (value === null || value === undefined || value === '') return '未提供'
+  const raw = typeof value === 'number' ? value : Number(value)
+  const date = Number.isFinite(raw)
+    ? new Date(raw > 1_000_000_000_000 ? raw : raw * 1000)
+    : new Date(String(value))
+  return Number.isNaN(date.getTime()) ? '未提供' : date.toLocaleString('zh-CN')
+}
+
+function FeeConfirmation({ config, manual = false }: { config: StockConfig; manual?: boolean }) {
+  return <>
+    <Paragraph>{manual ? '本次使用已保存配置。' : '保存开启后会立即检查库存。'}库存不足时先恢复缺少 RT 的已有账号，无可恢复候选时再新注册；有效 RT 且账态正常才计入库存，短信验证不是必要条件。</Paragraph>
+    <Paragraph>将复用全局接码平台、国家、单价限制和邮箱服务，可能产生邮箱／接码费用；每次账号尝试可能包含多次租号，请先核对全局接码单价及换号上限。</Paragraph>
+    <ul style={{ paddingInlineStart: 20, margin: '0 0 12px' }}>
+      <li>每轮最多 {config.max_attempts_per_run} 次账号尝试，达到目标 {config.min_accounts} 个可用 RT 账号即停止。</li>
+      <li>每日最多 {config.daily_attempt_limit} 次，按 UTC 日期计算；失败、跳过、重启均不退还已预留次数。</li>
+      <li>连续失败 {config.max_consecutive_failures} 次停止本轮，短信条数和实际费用仍受全局接码配置影响。</li>
+    </ul>
+    <Text type="secondary">取消仅放弃本次操作，不会更改已保存配置或已有任务；仅查看库存或刷新页面不会租号。</Text>
+  </>
 }
 
 export default function SmsStock() {
@@ -74,6 +114,7 @@ export default function SmsStock() {
   const [running, setRunning] = useState(false)
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [loadError, setLoadError] = useState('')
+  const [advancedKeys, setAdvancedKeys] = useState<string[]>([])
 
   const initialize = useCallback(async (signal: AbortSignal) => {
     const [nextConfig, nextStatus] = await Promise.all([
@@ -98,8 +139,18 @@ export default function SmsStock() {
       setStatus(result.status)
       setLoadError('')
     },
-    onError: error => setLoadError(error instanceof Error ? error.message : '加载接码库存失败'),
+    onError: error => setLoadError(error instanceof Error ? error.message : '加载可用 RT 库存失败'),
   })
+
+  const revealValidationErrors = (error: ValidationFailure) => {
+    const sections = error.errorFields.flatMap(({ name }) => {
+      const section = ADVANCED_FIELDS[name[0] as keyof StockConfig]
+      return section ? [section] : []
+    })
+    if (sections.length) setAdvancedKeys(keys => [...new Set([...keys, ...sections])])
+    const firstField = error.errorFields[0]?.name
+    if (firstField) requestAnimationFrame(() => form.scrollToField(firstField, { block: 'center', focus: true }))
+  }
 
   const persist = async (values: StockConfig) => {
     const signal = getSignal()
@@ -123,12 +174,19 @@ export default function SmsStock() {
 
   const save = async () => {
     let values: StockConfig
-    try { values = await form.validateFields() } catch { return }
+    try {
+      await form.validateFields()
+      // Preserve server values from every advanced panel, even before its first expansion.
+      values = form.getFieldsValue(true) as StockConfig
+    } catch (error) {
+      if (isValidationFailure(error)) revealValidationErrors(error)
+      return
+    }
     if (getSignal()?.aborted !== false) return
     if (!values.enabled) { await persist(values); return }
     modal.confirm({
-      title: '确认开启自动接码补库？',
-      content: `库存不足时会使用全局接码/邮箱服务并可能产生费用。每轮最多 ${values.max_attempts_per_run} 次、每日最多 ${values.daily_attempt_limit} 次账号尝试；短信条数和费用仍受全局接码配置影响。`,
+      title: '确认开启自动补库？',
+      content: <FeeConfirmation config={values} />,
       okText: '确认费用并开启', cancelText: '取消',
       onOk: () => persist(values),
     })
@@ -136,8 +194,8 @@ export default function SmsStock() {
 
   const runNow = () => modal.confirm({
     title: '确认按已保存配置执行一次补库？',
-    content: '先补已有账号的短信验证，没有可尝试账号时再注册并接码。此操作可能产生接码和邮箱费用，并计入每日尝试上限。',
-    okText: '确认并执行', cancelText: '取消',
+    content: <FeeConfirmation config={config} manual />,
+    okText: '确认费用并执行', cancelText: '取消',
     onOk: async () => {
       const signal = getSignal()
       if (!signal || signal.aborted) return
@@ -149,7 +207,7 @@ export default function SmsStock() {
         if (signal.aborted) return
         if (result.task_id) {
           setLogTaskId(result.task_id)
-          message.success('接码补库任务已创建')
+          message.success('补库任务已创建')
         } else {
           message.info(result.reason || '当前无需补库')
         }
@@ -161,80 +219,168 @@ export default function SmsStock() {
   })
 
   if (loading && !initialized) return <div style={{ padding: 80, textAlign: 'center' }}><Spin size="large" /></div>
-  if (!initialized) return <Alert type="error" showIcon message="无法读取接码库存配置" description={loadError}
+  if (!initialized) return <Alert type="error" showIcon message="无法读取可用 RT 库存配置" description={loadError}
     action={<Button onClick={() => void load()}>重试</Button>} />
   const stock = status?.inventory
+  const activeTask = status?.active
 
-  return <Space direction="vertical" size={16} style={{ width: '100%' }}>
-    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-      <div>
-        <Title level={3} style={{ margin: 0 }}>接码账号自动补库</Title>
-        <Paragraph type="secondary" style={{ margin: '4px 0 0' }}>库存低于目标时，先给已注册未接码账号补接码，没有可尝试账号时再注册＋接码。</Paragraph>
-      </div>
-      <Space>
+  return <div className="admin-page">
+    <AdminPageHeader
+      title="可用 RT 库存"
+      description="库存低于目标时优先恢复已有账号、按需新注册，账态正常且持有有效 RT 即计入，短信非必需。"
+      extra={<Space wrap>
         <Button icon={<ReloadOutlined />} onClick={() => void load()}>刷新库存</Button>
         <Button type="primary" icon={<PlayCircleOutlined />} loading={running} disabled={Boolean(status?.active)} onClick={runNow}>立即补库</Button>
-      </Space>
+      </Space>}
+    />
+
+    {loadError ? <Alert type="error" showIcon message="库存刷新失败，以下可能是旧数据" description={loadError} /> : null}
+
+    <div className="admin-metrics">
+      <MetricCard label="可用 RT 账号" value={stock?.verified_accounts ?? 0} hint={`目标 ${config.min_accounts} 个 · 短信非必需`} tone="accent" />
+      <MetricCard label="库存缺口" value={stock?.missing_accounts ?? 0} hint="达到已保存目标即停止补库" tone={stock?.missing_accounts ? 'warning' : 'success'} />
+      <MetricCard label="待恢复账号" value={stock?.pending_accounts ?? 0} hint={`当前可尝试 ${stock?.ready_candidates ?? 0} 个`} />
+      <MetricCard label="今日账号尝试" value={<>{stock?.daily_attempts_used ?? 0}<Text type="secondary" style={{ fontSize: 16 }}> / {config.daily_attempt_limit}</Text></>} hint={`UTC ${stock?.budget_date_utc || '—'} · 剩余 ${stock?.daily_attempts_remaining ?? 0} 次`} />
     </div>
-    {loadError && <Alert type="error" showIcon message="库存刷新失败，以下可能是旧数据" description={loadError} />}
-    <Alert type="warning" showIcon message="默认关闭；开启和立即执行都需要确认费用"
-      description="复用全局接码平台、单价限制、国家和邮箱配置。每次账号尝试可能包含多次租号，请先设置全局接码单价及换号上限。读取库存/刷新页面不会租号。每日尝试限额按 UTC 计算，失败、跳过、重启也不退还已预留次数。" />
-    <Row gutter={[16, 16]}>
-      <Col xs={12} md={6}><Card><Statistic title="当前正常接码账号" value={stock?.verified_accounts ?? 0} suffix={`/ ${config.min_accounts}`} /></Card></Col>
-      <Col xs={12} md={6}><Card><Statistic title="还需补充" value={stock?.missing_accounts ?? 0} /></Card></Col>
-      <Col xs={12} md={6}><Card><Statistic title="已注册未接码" value={stock?.pending_accounts ?? 0} /><Text type="secondary">本轮可尝试 {stock?.ready_candidates ?? 0} 个</Text></Card></Col>
-      <Col xs={12} md={6}><Card><Statistic title="今日账号尝试 / 上限" value={stock?.daily_attempts_used ?? 0} suffix={`/ ${config.daily_attempt_limit}`} /><Text type="secondary">UTC {stock?.budget_date_utc || '-'}</Text></Card></Col>
-    </Row>
-    <Row gutter={[16, 16]}>
-      <Col xs={24} xl={16}>
-        <Card title="补库策略（始终串行，达到目标立即停止）">
-          <Form form={form} layout="vertical" initialValues={DEFAULTS}>
-            <Row gutter={16}>
-              <Col xs={24} sm={12}><Form.Item name="enabled" label="启用自动补库" valuePropName="checked"><Switch checkedChildren="开启" unCheckedChildren="关闭" /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="min_accounts" label="最低／目标可用 RT 账号数" rules={[{ required: true }]}><InputNumber min={1} max={5000} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="interval_minutes" label="库存检查间隔（分钟）" rules={[{ required: true }]}><InputNumber min={1} max={10080} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="max_attempts_per_run" label="每轮最多账号尝试数" rules={[{ required: true }]}><InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="daily_attempt_limit" label="每日最多账号尝试数（UTC）" rules={[{ required: true }]}><InputNumber min={1} max={1000} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="max_consecutive_failures" label="连续失败多少次停止本轮" rules={[{ required: true }]}><InputNumber min={1} max={10} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="delay_seconds" label="两次尝试间隔（秒）" rules={[{ required: true }]}><InputNumber min={0} max={3600} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="candidate_cooldown_minutes" label="同一老账号重试冷却（分钟）" rules={[{ required: true }]}><InputNumber min={1} max={10080} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="allow_login" label="补已有账号时允许重新登录" valuePropName="checked"><Switch checkedChildren="允许" unCheckedChildren="禁止" /></Form.Item></Col>
-              <Col xs={24} sm={12}><Form.Item name="register_flow" label="没有候选账号时的新注册方式" rules={[{ required: true }]} extra="只要拿到有效 RT 且账态正常就计入库存，短信验证不是必要条件">
-                <Select options={[{ value: 'phone_with_email', label: '手机注册＋绑定邮箱' }, { value: 'phone', label: '手机注册' }, { value: 'email', label: '邮箱注册＋授权链接码' }]} />
-              </Form.Item></Col>
-            </Row>
-            <Space wrap><Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void save()}>保存配置</Button><Text type="secondary">立即补库使用已保存配置；关闭并保存会停止当前补库。</Text></Space>
-          </Form>
-        </Card>
-      </Col>
-      <Col xs={24} xl={8}>
-        <Card title="统计与执行规则">
-          <Descriptions column={1} size="small">
-            <Descriptions.Item label="自动补库"><Badge status={config.enabled ? 'success' : 'default'} text={config.enabled ? '已开启' : '已关闭'} /></Descriptions.Item>
-            <Descriptions.Item label="当前任务">{status?.active ? taskStatus(status.active.status) : '空闲'}</Descriptions.Item>
-            <Descriptions.Item label="执行阶段">{status?.active?.meta?.phase || '-'}</Descriptions.Item>
-            <Descriptions.Item label="库存口径">registered / trial / subscribed，且持有有效 RT（短信验证为独立记录，不强制）</Descriptions.Item>
-            <Descriptions.Item label="不计入库存">失效、过期、删除、封禁账号；只有短信记录、缺少 RT 的账号</Descriptions.Item>
-            <Descriptions.Item label="优先顺序">缺少 RT 的可恢复老账号 → 无可恢复候选时新注册</Descriptions.Item>
-            <Descriptions.Item label="含 Web 池账号">Web 池（免接码注册）账号有 AT 但缺 RT，会作为可补 RT／接码候选；补到 RT 后计入库存</Descriptions.Item>
-            <Descriptions.Item label="并发保护">已有 GPT 后台任务时本轮不启动；补库运行时不接受冲突任务</Descriptions.Item>
-            <Descriptions.Item label="失败处理">同号冷却、连续失败熔断、每轮／每日限额</Descriptions.Item>
-          </Descriptions>
-        </Card>
-      </Col>
-    </Row>
-    <Card title="补库任务历史">
-      <Table<StockTask> rowKey="id" size="small" dataSource={status?.tasks || []} pagination={{ pageSize: 10 }} scroll={{ x: 850 }} columns={[
-        { title: '任务', dataIndex: 'id', ellipsis: true },
-        { title: '状态', dataIndex: 'status', render: taskStatus },
-        { title: '尝试 / 每轮上限', dataIndex: 'progress' },
-        { title: '成功 / 跳过 / 失败', render: (_, task) => `${task.success} / ${task.skipped} / ${task.error_count ?? task.errors?.length ?? 0}` },
-        { title: '结束原因', render: (_, task) => task.meta?.reason || task.meta?.phase || '-' },
-        { title: '操作', render: (_, task) => <Button size="small" onClick={() => setLogTaskId(task.id)}>查看日志</Button> },
-      ]} />
+
+    <div className="admin-settings-grid">
+      <Card className="admin-panel" title="补库策略">
+        <Form form={form} layout="vertical" preserve>
+          <Row gutter={16}>
+            <Col xs={24} sm={12}>
+              <Form.Item name="enabled" label="启用自动补库" valuePropName="checked">
+                <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Form.Item name="min_accounts" label="目标可用 RT 账号数" rules={[{ required: true, message: '请输入目标账号数' }]}>
+                <InputNumber min={1} max={5000} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+            <Col xs={24} sm={12}>
+              <Form.Item name="interval_minutes" label="库存检查间隔（分钟）" rules={[{ required: true, message: '请输入检查间隔' }]}>
+                <InputNumber min={1} max={10080} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+            </Col>
+          </Row>
+          <div className="admin-note" style={{ marginBottom: 16 }}>可能产生邮箱/接码费用</div>
+          <Collapse
+            activeKey={advancedKeys}
+            onChange={keys => setAdvancedKeys(Array.isArray(keys) ? keys : [keys])}
+            items={[
+              {
+                key: 'limits', label: '高级 · 每轮 / 每日限额与失败保护', forceRender: true,
+                children: <>
+                  <Paragraph type="secondary">每日尝试限额按 UTC 日期计算；失败、跳过、重启均不退还已预留次数。连续失败达到阈值后停止本轮。</Paragraph>
+                  <Row gutter={16}>
+                    <Col xs={24} sm={12}>
+                      <Form.Item name="max_attempts_per_run" label="每轮最多账号尝试数" rules={[{ required: true, message: '请输入每轮尝试上限' }]}>
+                        <InputNumber min={1} max={100} precision={0} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} sm={12}>
+                      <Form.Item name="daily_attempt_limit" label="每日最多账号尝试数（UTC）" rules={[{ required: true, message: '请输入每日尝试上限' }]}>
+                        <InputNumber min={1} max={1000} precision={0} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} sm={12}>
+                      <Form.Item name="max_consecutive_failures" label="连续失败多少次停止本轮" rules={[{ required: true, message: '请输入连续失败阈值' }]}>
+                        <InputNumber min={1} max={10} precision={0} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                </>,
+              },
+              {
+                key: 'rate', label: '高级 · 尝试间隔与账号冷却', forceRender: true,
+                children: <Row gutter={16}>
+                  <Col xs={24} sm={12}>
+                    <Form.Item name="delay_seconds" label="两次尝试间隔（秒）" rules={[{ required: true, message: '请输入尝试间隔' }]}>
+                      <InputNumber min={0} max={3600} style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} sm={12}>
+                    <Form.Item name="candidate_cooldown_minutes" label="同一老账号重试冷却（分钟）" rules={[{ required: true, message: '请输入账号冷却时间' }]}>
+                      <InputNumber min={1} max={10080} precision={0} style={{ width: '100%' }} />
+                    </Form.Item>
+                  </Col>
+                </Row>,
+              },
+              {
+                key: 'recovery', label: '高级 · RT 恢复与新注册方式', forceRender: true,
+                children: <Row gutter={16}>
+                  <Col xs={24} sm={12}>
+                    <Form.Item name="allow_login" label="恢复已有账号时允许重新登录" valuePropName="checked">
+                      <Switch checkedChildren="允许" unCheckedChildren="禁止" />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24}>
+                    <Form.Item name="register_flow" label="没有候选账号时的新注册方式" rules={[{ required: true, message: '请选择新注册方式' }]} extra="账态正常且持有有效 RT 即可计入库存，短信验证不是必要条件">
+                      <Select options={[{ value: 'phone_with_email', label: '手机注册＋绑定邮箱' }, { value: 'phone', label: '手机注册' }, { value: 'email', label: '邮箱注册＋授权链接码' }]} />
+                    </Form.Item>
+                  </Col>
+                </Row>,
+              },
+            ]}
+          />
+          <div className="admin-save-bar" style={{ marginTop: 20 }}>
+            <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void save()}>保存配置</Button>
+            <Text type="secondary">立即补库使用已保存配置；关闭并保存会停止当前补库。</Text>
+          </div>
+        </Form>
+      </Card>
+
+      <Card className="admin-panel" title="运行概览">
+        <Descriptions column={1} size="small">
+          <Descriptions.Item label="自动补库"><Badge status={config.enabled ? 'success' : 'default'} text={config.enabled ? '已开启' : '已关闭'} /></Descriptions.Item>
+          <Descriptions.Item label="当前任务">{status?.active ? taskStatus(status.active.status) : '空闲'}</Descriptions.Item>
+          <Descriptions.Item label="执行阶段">{status?.active?.meta?.phase || '—'}</Descriptions.Item>
+          <Descriptions.Item label="执行方式">始终串行，达到目标立即停止</Descriptions.Item>
+          <Descriptions.Item label="可用口径">registered / trial / subscribed，且持有有效 RT；短信验证为独立记录</Descriptions.Item>
+        </Descriptions>
+        {activeTask ? <Button style={{ marginTop: 16 }} onClick={() => setLogTaskId(activeTask.id)}>查看当前日志</Button> : null}
+        <Collapse
+          ghost
+          style={{ marginTop: 16 }}
+          items={[{
+            key: 'rules', label: '查看库存口径与执行保护',
+            children: <Descriptions column={1} size="small">
+              <Descriptions.Item label="不计入库存">失效、过期、删除、封禁账号；只有短信记录但缺少 RT 的账号</Descriptions.Item>
+              <Descriptions.Item label="优先顺序">缺少 RT 的可恢复老账号 → 无可恢复候选时新注册</Descriptions.Item>
+              <Descriptions.Item label="Web 池账号">免接码注册账号有 AT 但缺 RT 时，可能成为补 RT／接码候选；补到有效 RT 且账态正常才计入库存</Descriptions.Item>
+              <Descriptions.Item label="并发保护">已有 GPT 后台任务时本轮不启动；补库运行时不接受冲突任务</Descriptions.Item>
+              <Descriptions.Item label="停止与保护">同号冷却、连续失败熔断、每轮／每日限额；关闭自动补库并保存可停止当前任务</Descriptions.Item>
+              <Descriptions.Item label="只读操作">查看库存和刷新页面不会租号</Descriptions.Item>
+            </Descriptions>,
+          }]}
+        />
+      </Card>
+    </div>
+
+    <Card className="admin-panel" title="补库任务历史" extra={<Text type="secondary">最近 {status?.tasks?.length || 0} 次</Text>}>
+      <Table<StockTask>
+        rowKey="id"
+        size="small"
+        dataSource={status?.tasks || []}
+        pagination={{ pageSize: 10, hideOnSinglePage: true }}
+        locale={{ emptyText: '暂无补库任务' }}
+        scroll={{ x: 680 }}
+        columns={[
+          { title: '时间', dataIndex: 'created_at', width: 190, render: (value: StockTask['created_at'], task: StockTask) => <Tooltip title={`任务 ID：${task.id}`}>{formatTime(value)}</Tooltip> },
+          { title: '状态', dataIndex: 'status', width: 100, render: taskStatus },
+          { title: '处理结果', render: (_: unknown, task: StockTask) => <div>
+            <Text>成功 {task.success} · 跳过 {task.skipped} · 失败 {task.error_count ?? task.errors?.length ?? 0}</Text>
+            <div><Text type="secondary" style={{ fontSize: 12 }}>尝试 {task.progress || '—'} · {task.meta?.reason || task.meta?.phase || '暂无结束原因'}</Text></div>
+          </div> },
+          { title: '日志', width: 110, render: (_: unknown, task: StockTask) => <Button size="small" onClick={() => setLogTaskId(task.id)}>查看日志</Button> },
+        ]}
+      />
     </Card>
-    <Drawer title="接码补库日志" open={Boolean(logTaskId)} onClose={() => setLogTaskId(null)} width={800} destroyOnClose>
-      {logTaskId && <TaskLogPanel taskId={logTaskId} kind="sms_stock" onDone={() => void load()} />}
+    <Drawer title="补库日志" open={Boolean(logTaskId)} onClose={() => setLogTaskId(null)} width="min(800px, 100vw)" destroyOnClose>
+      {logTaskId ? <>
+        <Paragraph type="secondary" style={{ overflowWrap: 'anywhere' }}>任务 ID：<Text code>{logTaskId}</Text></Paragraph>
+        <TaskLogPanel taskId={logTaskId} kind="sms_stock" onDone={() => void load()} />
+      </> : null}
     </Drawer>
-  </Space>
+  </div>
 }

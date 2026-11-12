@@ -159,6 +159,7 @@ class RegisterTaskRecord:
     registered: int = 0
     skipped: int = 0
     errors: list[str] = field(default_factory=list)
+    error_count: int = 0
     cashier_urls: list[str] = field(default_factory=list)
     error: str = ""
     created_at: float = field(default_factory=time.time)
@@ -184,6 +185,7 @@ class RegisterTaskRecord:
             "registered": self.registered,
             "skipped": self.skipped,
             "errors": list(self.errors),
+            "error_count": max(self.error_count, len(self.errors)),
             "control": self.control.snapshot(),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -357,6 +359,7 @@ class RegisterTaskStore:
         *,
         success: int | None = None,
         registered: int | None = None,
+        error_count: int | None = None,
     ) -> None:
         with self._lock:
             record = self._records[task_id]
@@ -364,6 +367,8 @@ class RegisterTaskStore:
                 record.success = max(0, int(success))
             if registered is not None:
                 record.registered = max(0, int(registered))
+            if error_count is not None:
+                record.error_count = max(0, int(error_count))
             record.updated_at = time.time()
 
     def finish(
@@ -376,6 +381,7 @@ class RegisterTaskStore:
         skipped: int,
         errors: list[str],
         error: str = "",
+        error_count: int | None = None,
     ) -> None:
         with self._lock:
             record = self._records[task_id]
@@ -387,6 +393,7 @@ class RegisterTaskStore:
                 record.registered = max(0, int(registered))
             record.skipped = skipped
             record.errors = list(errors)
+            record.error_count = max(len(errors), int(error_count or 0))
             record.error = error
             record.updated_at = time.time()
 

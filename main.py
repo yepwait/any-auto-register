@@ -78,6 +78,9 @@ async def lifespan(app: FastAPI):
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
     from core.scheduler import scheduler
     scheduler.start()
+    from services import web_pool_events
+    if os.getenv("APP_ENABLE_SCHEDULER", "1").lower() not in {"0", "false", "no", "off"}:
+        web_pool_events.start()
     from services.solver_manager import start_async
     start_async()
     try:
@@ -85,6 +88,7 @@ async def lifespan(app: FastAPI):
     finally:
         from core.scheduler import scheduler as _scheduler
         _scheduler.stop()
+        web_pool_events.stop()
         from api.tasks import stop_task_producers
         stop_task_producers()
         # Flush accepted uploads/TaskLogs before the final append-log batch.
@@ -104,8 +108,35 @@ async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/auth/") or not path.startswith("/api/"):
         return await call_next(request)
-    # Webhook trigger uses its own secret; skip panel JWT check for this endpoint.
-    if path == "/api/chatgpt-web-pool/trigger":
+    # Only the exact POST hook uses its own mandatory authentication. All
+    # neighboring paths/methods still require the panel JWT when configured.
+    if path == "/api/chatgpt-web-pool/trigger" and request.method == "POST":
+        length = request.headers.get("content-length", "")
+        if length.isdigit() and int(length) > 4096:
+            return JSONResponse({"detail": "实时通知体过大"}, status_code=413)
+        from api.chatgpt_web_pool import verify_trigger_secret
+        provided = (request.headers.get("X-Replenish-Secret") or "").strip()
+        try:
+            # Existing body-only secret clients are checked in the endpoint;
+            # no configured secret still fails closed before reading any body.
+            if provided:
+                verify_trigger_secret(provided)
+            else:
+                from core.config_store import config_store
+                if not str(config_store.get("chatgpt_web_pool_trigger_secret", "") or "").strip():
+                    raise HTTPException(503, "实时触发未配置密钥，入口已关闭")
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+        # Enforce received bytes too: chunked or forged Content-Length must not
+        # force an unbounded JSON body into memory before secret verification.
+        chunks = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > 4096:
+                return JSONResponse({"detail": "实时通知体过大"}, status_code=413)
+            chunks.append(chunk)
+        request._body = b"".join(chunks)
         return await call_next(request)
     from core.config_store import config_store as _cs
     if not _cs.get("auth_password_hash", ""):

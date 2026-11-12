@@ -45,6 +45,7 @@ body {
 
 #root {
   min-height: 100vh;
+  min-height: 100dvh;
 }
 
 .ant-layout-sider-trigger {
@@ -183,4 +184,145 @@ body {
   background: var(--accent-soft);
   border-color: var(--accent-soft);
   color: var(--accent-hover);
+}
+
+/* Management pages: prioritize current state, keep configuration progressive. */
+.admin-page {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  max-width: 1480px;
+  margin: 0 auto;
+  min-width: 0;
+}
+.admin-page-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 2px 0 4px;
+}
+.admin-page-heading { min-width: 0; }
+.admin-kicker {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--accent-hover);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.8px;
+  text-transform: uppercase;
+}
+.admin-page-heading h1 { margin: 0; color: var(--text); font-size: 25px; line-height: 1.45; font-weight: 650; letter-spacing: -.5px; }
+.admin-page-description { color: var(--text-muted); font-size: 13px; line-height: 1.65; margin-top: 5px; }
+.admin-page-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.admin-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.admin-metric.ant-card { border-radius: 12px; min-width: 0; overflow: hidden; }
+.admin-metric .ant-card-body { padding: 20px 22px; }
+.admin-metric-label { color: var(--text-secondary); font-size: 12px; margin-bottom: 10px; }
+.admin-metric-value { color: var(--text); font-size: 29px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -.7px; line-height: 1.4; overflow-wrap: anywhere; }
+.admin-metric-value .ant-tag { vertical-align: middle; font-size: 12px; font-weight: 500; letter-spacing: 0; }
+.admin-metric-hint { color: var(--text-muted); font-size: 12px; line-height: 1.6; margin-top: 7px; overflow-wrap: anywhere; }
+.admin-metric--accent .admin-metric-value { color: var(--accent-hover); }
+.admin-metric--success .admin-metric-value { color: var(--success); }
+.admin-metric--warning .admin-metric-value { color: var(--warning); }
+.admin-metric--danger .admin-metric-value { color: var(--danger); }
+.admin-settings-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(300px, 1fr); gap: 18px; align-items: start; }
+.admin-settings-grid > * { min-width: 0; }
+.admin-secondary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.admin-panel.ant-card { border-radius: 12px; }
+.admin-panel .ant-card-head { min-height: 58px; padding: 0 22px; }
+.admin-panel .ant-card-head-title { font-size: 14px; font-weight: 600; }
+.admin-panel .ant-card-body { padding: 22px; }
+.admin-panel .ant-form-item { margin-bottom: 19px; }
+.admin-panel .ant-form-item-label > label { font-size: 12px; color: var(--text-secondary); }
+.admin-panel .ant-form-item-extra { font-size: 12px; }
+.admin-note { color: var(--text-muted); font-size: 12px; line-height: 1.7; }
+.admin-inline-meta { display: flex; gap: 8px 16px; align-items: center; flex-wrap: wrap; color: var(--text-muted); font-size: 12px; }
+.admin-save-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding-top: 18px; border-top: 1px solid var(--border); margin-top: 4px; }
+.admin-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.admin-connection-summary { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.admin-connection-host { color: var(--text); font-size: 14px; font-weight: 550; word-break: break-all; }
+.admin-connection-summary .ant-btn { flex-shrink: 0; }
+.admin-state-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.admin-state-row:last-child { border-bottom: none; }
+.admin-state-row > :first-child { color: var(--text-muted); font-size: 12px; flex-shrink: 0; }
+.admin-state-row > :last-child { text-align: right; color: var(--text-secondary); font-size: 13px; overflow-wrap: anywhere; min-width: 0; }
+.admin-collapse.ant-collapse { border: 0; background: transparent; }
+.admin-collapse > .ant-collapse-item { border-bottom: 1px solid var(--border); }
+.admin-collapse > .ant-collapse-item:last-child { border-bottom: 0; }
+.admin-collapse .ant-collapse-header { padding: 15px 0 !important; align-items: center !important; color: var(--text-secondary) !important; font-size: 13px; }
+.admin-collapse .ant-collapse-content > .ant-collapse-content-box { padding: 0 0 8px; }
+.admin-table .ant-table-thead > tr > th { font-size: 12px; }
+.admin-table .ant-table-tbody > tr > td { font-size: 13px; }
+.admin-table .ant-table-cell { overflow-wrap: anywhere; }
+.admin-task-title { font-weight: 550; font-size: 14px; color: var(--text); }
+.admin-task-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-muted); font-size: 11px; }
+.admin-page .ant-descriptions-item-label { font-size: 12px; color: var(--text-muted); }
+.admin-page .ant-descriptions-item-content { font-size: 13px; }
+.admin-compact-toolbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+.admin-filter-group, .admin-action-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.admin-app-layout { height: 100vh; height: 100dvh; overflow: hidden; }
+.admin-shell-content { padding: 26px 30px; min-width: 0; min-height: 0; overscroll-behavior: contain; }
+/* Pure list pages own their remaining viewport; form/dashboard pages still scroll normally. */
+.admin-list-page { height: 100%; min-height: 0; overflow: hidden; }
+.admin-list-page > .admin-page-header,
+.admin-list-page > .admin-list-controls { flex-shrink: 0; }
+.admin-table-viewport { flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.admin-table-viewport > .ant-table-wrapper,
+.admin-table-viewport > .ant-table-wrapper > .ant-spin-nested-loading,
+.admin-table-viewport > .ant-table-wrapper > .ant-spin-nested-loading > .ant-spin-container { height: 100%; min-height: 0; }
+.admin-table-viewport .ant-spin-container { display: flex; flex-direction: column; }
+.admin-table-viewport .ant-table { flex: 1; min-height: 0; }
+.admin-table-viewport .ant-table-container { height: 100%; display: flex; flex-direction: column; }
+.admin-table-viewport .ant-table-header { flex-shrink: 0; }
+.admin-table-viewport .ant-table-body { flex: 1; min-height: 0; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.admin-table-viewport .ant-table-pagination { flex-shrink: 0; }
+.admin-list-card { flex: 1; min-height: 0; }
+.admin-list-card > .ant-card-body { height: 100%; min-height: 0; display: flex; flex-direction: column; }
+.admin-list-card > .ant-card-body > .admin-compact-toolbar { flex-shrink: 0; }
+@media (max-height: 620px), (max-width: 600px) {
+  .admin-list-page { gap: 12px; }
+  /* In short/zoomed viewports, keep the controls reachable without consuming the entire list. */
+  .admin-list-page > .admin-list-controls { max-height: 42dvh; overflow: auto; }
+  .admin-list-controls .ant-card-body { padding: 14px; }
+  .admin-list-page .admin-page-description { display: none; }
+}
+@media (max-height: 620px) {
+  .admin-list-page > .admin-list-controls { max-height: 25dvh; }
+  .admin-list-page .admin-kicker { display: none; }
+}
+.admin-settings-layout { display: flex; gap: 24px; min-width: 0; }
+.admin-settings-nav { flex: 0 0 184px; width: 184px; }
+.admin-settings-nav .ant-tabs { min-height: 280px; }
+@media (max-width: 900px) {
+  .admin-settings-layout { flex-direction: column; gap: 16px; }
+  .admin-settings-nav { width: 100%; flex-basis: auto; }
+  .admin-settings-nav .ant-tabs { min-height: 0; }
+  .admin-settings-nav .ant-tabs-nav { width: 100%; }
+  .admin-settings-nav .ant-tabs-nav-list { flex-direction: row !important; flex-wrap: wrap; }
+  .admin-settings-nav .ant-tabs-tab { margin: 0 !important; padding: 9px 12px !important; }
+  .admin-settings-nav .ant-tabs-ink-bar { display: none; }
+}
+@media (min-width: 1600px) { .admin-shell-content { padding: 30px 40px; } }
+@media (max-width: 1100px) {
+  .admin-settings-grid { grid-template-columns: minmax(0, 1fr); }
+  .admin-shell-content { padding: 22px; }
+}
+@media (max-width: 767px) {
+  .admin-page { gap: 16px; }
+  .admin-page-heading h1 { font-size: 22px; }
+  .admin-page-description { font-size: 12px; }
+  .admin-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .admin-metric .ant-card-body { padding: 16px; }
+  .admin-metric-value { font-size: 24px; }
+  .admin-secondary-grid { grid-template-columns: minmax(0, 1fr); }
+  .admin-panel .ant-card-body { padding: 18px; }
+  .admin-panel .ant-card-head { padding: 0 18px; }
+  .admin-page-actions { width: 100%; }
+  .admin-shell-content { padding: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-in, .animate-slide-in-up, .animate-slide-in-right, .page-enter { animation: none; }
+  .hover-lift { transition: none; }
 }

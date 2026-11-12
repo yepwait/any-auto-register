@@ -13,8 +13,9 @@ import {
 import { PaymentOptionsForm } from '@/components/payments/PaymentOptionsForm'
 import { PaymentResultsTable } from '@/components/payments/PaymentResultsTable'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { AdminPageHeader } from '@/components/admin/AdminPage'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 
 interface AccountRow { id: number; email: string; status: string; token?: string; extra_json?: string }
 interface PaymentTaskRow { id: string; source?: string; status: string; total: number; success: number; updated_at?: string; meta?: { operation?: PaymentOperation; channel?: string; account_ids?: number[]; options?: Record<string, unknown>; results?: PaymentResult[] } }
@@ -141,14 +142,10 @@ export default function Payments() {
   }
 
   return (
-    <div>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, gap: 12, flexWrap: 'wrap' }}>
-        <Space>
-          <CreditCardOutlined style={{ color: 'var(--accent)', fontSize: 20 }} />
-          <Title level={4} style={{ margin: 0 }}>支付中心</Title>
-        </Space>
+    <div className="admin-page">
+      <AdminPageHeader title="支付中心" kicker="PAYMENTS" description="选择账号、配置渠道，按任务查看提链与支付结果。" extra={
         <Button icon={<ReloadOutlined />} loading={loading} onClick={() => { setLoading(true); Promise.all([loadAccounts(), loadPaymentConfig(), loadTasks()]).finally(() => setLoading(false)) }}>刷新</Button>
-      </div>
+      } />
 
       <Tabs activeKey={tab} onChange={setTab} items={[
         { key: 'workbench', label: <Space><PlayIcon /><span>操作台</span></Space> },
@@ -157,8 +154,9 @@ export default function Payments() {
       ]} />
 
       {tab === 'workbench' ? (
-        <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 360px', gap: 16, alignItems: 'start' }}>
-          <Card title={<Space><span>ChatGPT 账号</span><Tag>{filteredAccounts.length}</Tag></Space>} extra={<Input.Search placeholder="搜索邮箱" allowClear onChange={(event) => setAccountSearch(event.target.value)} style={{ width: 220 }} />}>
+        <div className="admin-settings-grid">
+          <Card className="admin-panel" title={<Space><span>ChatGPT 账号</span><Tag>{filteredAccounts.length}</Tag></Space>}>
+            <Input.Search placeholder="搜索邮箱" allowClear onChange={(event) => setAccountSearch(event.target.value)} style={{ width: '100%', maxWidth: 360, marginBottom: 16 }} />
             <Table<AccountRow>
               size="small"
               rowKey="id"
@@ -170,11 +168,11 @@ export default function Payments() {
               columns={[
                 { title: '邮箱', dataIndex: 'email', ellipsis: true },
                 { title: '状态', dataIndex: 'status', width: 100, render: (value: string) => <Tag>{value || '-'}</Tag> },
-                { title: 'Token', key: 'token', width: 90, render: (_: unknown, row: AccountRow) => <Tag color={row.token ? 'success' : 'default'}>{row.token ? '可用' : '缺少'}</Tag> },
+                { title: 'Token', key: 'token', width: 90, render: (_: unknown, row: AccountRow) => <Tag color={row.token ? 'default' : 'warning'}>{row.token ? '已保存' : '缺少'}</Tag> },
               ]}
             />
           </Card>
-          <div style={{ borderLeft: '1px solid var(--border)', paddingLeft: 16 }}>
+          <Card className="admin-panel" title="操作配置">
             <Space direction="vertical" size={16} style={{ width: '100%' }}>
               <div><Text type="secondary">操作</Text><Segmented block value={operation} options={[{ value: 'link', label: <><LinkOutlined /> 提链</> }, { value: 'pay', label: <><CreditCardOutlined /> 支付</> }]} onChange={(value) => { const next = value as PaymentOperation; setOperation(next); setOptions({ ...defaults(channel, next), [proxyKey(next)]: next === 'link' ? paymentProxies.link : paymentProxies.pay }) }} style={{ marginTop: 8 }} /></div>
               <div><Text type="secondary">支付渠道</Text><Select value={channelName} onChange={(value) => { const next = channels.find((item) => item.name === value); setChannelName(value); setOptions({ ...defaults(next, operation), [proxyKey(operation)]: operation === 'link' ? paymentProxies.link : paymentProxies.pay }) }} options={channels.map((item) => ({ value: item.name, label: item.display_name }))} style={{ width: '100%', marginTop: 8 }} /></div>
@@ -198,7 +196,7 @@ export default function Payments() {
                 </Space>
               </div>
             </Space>
-          </div>
+          </Card>
         </div>
       ) : null}
 

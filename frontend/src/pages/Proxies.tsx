@@ -1,5 +1,5 @@
 import { useEffect, useState, type Key } from 'react'
-import { Card, Table, Button, Input, Tag, Space, Popconfirm, message, Modal } from 'antd'
+import { Card, Collapse, Table, Button, Input, Tag, Space, Popconfirm, message, Modal } from 'antd'
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -10,8 +10,11 @@ import {
   SwapLeftOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { AdminPageHeader } from '@/components/admin/AdminPage'
+import { useTableViewport } from '@/hooks/useTableViewport'
 
 export default function Proxies() {
+  const { viewportRef, bodyHeight } = useTableViewport()
   const [proxies, setProxies] = useState<any[]>([])
   const [newProxy, setNewProxy] = useState('')
   const [region, setRegion] = useState('')
@@ -175,18 +178,13 @@ export default function Proxies() {
   ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>代理管理</h1>
-          <p style={{ color: 'var(--text-muted)', marginTop: 4 }}>共 {proxies.length} 个代理</p>
-        </div>
-        <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
-          检测全部
-        </Button>
-      </div>
+    <div className="admin-page admin-list-page">
+      <AdminPageHeader title="代理管理" kicker="PROXIES" description={`共 ${proxies.length} 个代理，按地区管理注册和服务连接。`} extra={
+        <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>检测全部</Button>
+      } />
 
-      <Card title="添加代理（每行一个）">
+      <div className="admin-list-controls">
+      <Collapse className="admin-proxy-add" items={[{ key: 'add', label: <Space><PlusOutlined />添加代理<span className="admin-note">每行一个地址</span></Space>, forceRender: true, children:
         <Space direction="vertical" style={{ width: '100%' }}>
           <Input.TextArea
             value={newProxy}
@@ -206,11 +204,12 @@ export default function Proxies() {
               添加
             </Button>
           </Space>
-        </Space>
-      </Card>
+        </Space>,
+      }]} />
+      </div>
 
-      <Card>
-        <div style={{ marginBottom: 12, display: 'flex', justifyContent: 'space-between' }}>
+      <Card className="admin-panel admin-list-card">
+        <div className="admin-compact-toolbar" style={{ marginBottom: 12 }}>
           <div style={{ color: 'var(--text-muted)' }}>
             已选中 {selectedRowKeys.length} 条
           </div>
@@ -227,7 +226,10 @@ export default function Proxies() {
             </Button>
           </Popconfirm>
         </div>
+        <div ref={viewportRef} className="admin-table-viewport">
         <Table
+          className="admin-table"
+          scroll={{ x: 640, y: bodyHeight }}
           rowKey="id"
           columns={columns}
           dataSource={proxies}
@@ -238,6 +240,7 @@ export default function Proxies() {
           }}
           pagination={false}
         />
+        </div>
       </Card>
     </div>
   )

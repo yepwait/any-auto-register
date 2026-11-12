@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Table,
+  Card,
   Button,
   Input,
   InputNumber,
@@ -31,12 +32,15 @@ import {
   DeleteOutlined,
   SyncOutlined,
   KeyOutlined,
+  FilterOutlined,
 } from '@ant-design/icons'
 import { AccountExportModal } from '@/components/AccountExportModal'
 import { ChatGPTBind2faSwitch } from '@/components/ChatGPTBind2faSwitch'
 import { ChatGPTRegisterFlowSelect } from '@/components/ChatGPTRegisterFlowSelect'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { AdminPageHeader } from '@/components/admin/AdminPage'
+import { useTableViewport } from '@/hooks/useTableViewport'
 import type { TaskKind } from '@/components/TaskLogPanel'
 import { PaymentOperationDrawer } from '@/components/payments/PaymentOperationDrawer'
 import { usePersistentChatGPTBind2fa } from '@/hooks/usePersistentChatGPTBind2fa'
@@ -109,6 +113,7 @@ function normalizeAccount(account: any) {
   const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
   const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
+  const webPoolSync = syncStatuses.chatgpt2api && typeof syncStatuses.chatgpt2api === 'object' ? syncStatuses.chatgpt2api : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
   const plusCheck = extra.plus_check && typeof extra.plus_check === 'object' ? extra.plus_check : {}
   const totpSecret = String(extra.totp_secret || '')
@@ -124,7 +129,7 @@ function normalizeAccount(account: any) {
     totpSecret,
     smsVerification,
     webPoolOnly: extra.account_purpose === 'chatgpt_web_pool' || ['1', 'true'].includes(String(extra.chatgpt_web_only).toLowerCase()),
-    webPoolSync: syncStatuses.chatgpt2api || {},
+    webPoolSync,
   }
 
 }
@@ -189,6 +194,69 @@ function codexStateMeta(state?: string) {
     default:
       return { color: 'default', label: '未探测' }
   }
+}
+
+type SmsVerification = { verified?: unknown; country?: string }
+
+type AccountProbe = {
+  auth?: {
+    state?: string
+    message?: string
+    refresh_attempts?: { strategy?: string; ok?: boolean }[]
+  }
+  codex?: { state?: string; message?: string }
+}
+
+type WebPoolSync = {
+  needs_resync?: boolean
+  ready?: boolean
+  imported?: boolean
+  quota?: number | null
+  checked_at?: string
+}
+
+function smsVerificationMeta(verification?: SmsVerification) {
+  if (verification?.verified === true) {
+    return { color: 'success', label: `已接码${verification.country ? ` (${verification.country})` : ''}` }
+  }
+  return { color: 'default', label: '无接码记录' }
+}
+
+function rtProbeMeta(probe: AccountProbe | undefined, hasRefreshToken: boolean) {
+  // 只有 OAuth 刷新尝试能直接说明 RT 结果，AT/Codex 探测保留各自的含义。
+  const attempts = probe?.auth?.refresh_attempts
+  const oauthAttempt = Array.isArray(attempts) ? attempts.findLast((attempt) => attempt?.strategy === 'oauth') : undefined
+  if (oauthAttempt?.ok === true) return { color: 'success', label: 'RT 刷新成功' }
+  if (oauthAttempt?.ok === false) return { color: 'warning', label: 'RT 刷新失败' }
+
+  const codexState = probe?.codex?.state
+  if (codexState && !['not_checked', 'skipped_auth_invalid', 'unknown'].includes(codexState)) {
+    const meta = codexStateMeta(codexState)
+    return { ...meta, label: `Codex ${meta.label}` }
+  }
+  const authState = probe?.auth?.state
+  if (authState && authState !== 'unknown') return authStateMeta(authState)
+  return { color: 'default', label: hasRefreshToken ? '有 RT · 未检测' : '无 RT · 未检测' }
+}
+
+function WebPoolSyncSummary({ sync }: { sync: WebPoolSync }) {
+  const needsResync = sync.needs_resync === true
+  const color = needsResync ? 'warning' : sync.ready ? 'success' : sync.imported ? 'warning' : 'default'
+  const label = needsResync
+    ? '凭证更新待同步'
+    : sync.ready ? 'Web 远端已确认可用' : sync.imported ? '已入 Web 池，未确认可用' : 'Web 账号待上传'
+
+  return (
+    <Space direction="vertical" size={2}>
+      <Tag color={color} title={sync.checked_at ? `上次同步：${formatSyncTime(sync.checked_at)}` : undefined}>
+        {label}
+      </Tag>
+      {needsResync ? <Text type="secondary" style={{ fontSize: 12 }}>本地凭证已更新，等待同步后重新确认 Web 可用性。</Text> : null}
+      {sync.imported ? (
+        <Text type="secondary" style={{ fontSize: 12 }}>上次记录图片额度：{sync.quota ?? '-'}（非实时）</Text>
+      ) : null}
+    </Space>
+  )
 }
 
 const PLUS_TRIAL_FILTERS = [
@@ -755,6 +823,8 @@ export default function Accounts() {
   const [filterSmsVerified, setFilterSmsVerified] = useState('')
   const [createdAtStart, setCreatedAtStart] = useState('')
   const [createdAtEnd, setCreatedAtEnd] = useState('')
+  const [dateFiltersOpen, setDateFiltersOpen] = useState(false)
+  const { viewportRef, bodyHeight } = useTableViewport()
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
@@ -847,13 +917,10 @@ export default function Accounts() {
     message.success(`${label}已复制`)
   }
 
-  const getRefreshToken = (record: any): string => {
-    try {
-      const extra = JSON.parse(record.extra_json || '{}')
-      return extra.refresh_token || extra.refreshToken || ''
-    } catch {
-      return ''
-    }
+  const getRefreshToken = (record: { extra?: Record<string, unknown>; extra_json?: string }): string => {
+    const extra = record.extra || parseExtraJson(record.extra_json)
+    const refreshToken = extra.refresh_token || extra.refreshToken
+    return typeof refreshToken === 'string' ? refreshToken : ''
   }
 
   const handleDelete = async (id: number) => {
@@ -1264,7 +1331,7 @@ export default function Accounts() {
           <Text type="secondary" style={secondaryTextStyle} ellipsis={{ tooltip: record.user_id || `账号 #${record.id}` }}>
             {record.user_id ? `UID: ${record.user_id}` : `账号 #${record.id}`}
           </Text>
-          {record.webPoolOnly ? <Tag color="cyan">Web 号池专用 · 免手机接码</Tag> : null}
+          {record.webPoolOnly ? <Tag color="cyan">Web 注册来源</Tag> : null}
         </div>
       ),
     },
@@ -1310,9 +1377,10 @@ export default function Accounts() {
       title: '接码记录',
       key: 'sms_verification',
       width: 130,
-      render: (_: unknown, record: any) => record.webPoolOnly ? <Tag color="cyan">Web 池注册（未接码）</Tag> : record.smsVerification?.verified ? (
-        <Tag color="success">已接码{record.smsVerification.country ? ` (${record.smsVerification.country})` : ''}</Tag>
-      ) : <Tag color="default">未知</Tag>,
+      render: (_: unknown, record: { smsVerification?: SmsVerification }) => {
+        const meta = smsVerificationMeta(record.smsVerification)
+        return <Tag color={meta.color}>{meta.label}</Tag>
+      },
     },
   ]
 
@@ -1321,13 +1389,11 @@ export default function Accounts() {
       {
         title: 'RT 测活',
         key: 'rt_probe',
-        width: 110,
-        render: (_: unknown, record: any) => {
-          if (record.webPoolOnly) return <Tag color="cyan">Web 池账号</Tag>
-          const state = record.chatgptLocal?.codex?.state
-          if (!state) return <Tag>未测活</Tag>
-          const valid = ['access_token_valid', 'usable'].includes(state)
-          return <Tag color={valid ? 'success' : 'error'}>{valid ? 'RT有效' : 'RT失效'}</Tag>
+        width: 150,
+        render: (_: unknown, record: { chatgptLocal?: AccountProbe; extra_json?: string }) => {
+          const meta = rtProbeMeta(record.chatgptLocal, Boolean(getRefreshToken(record)))
+          const probeMessage = record.chatgptLocal?.codex?.message || record.chatgptLocal?.auth?.message
+          return <Tag color={meta.color} title={probeMessage}>{meta.label}</Tag>
         },
       },
       {
@@ -1335,15 +1401,6 @@ export default function Accounts() {
         key: 'chatgpt_local_state',
         width: 320,
         render: (_: any, record: any) => {
-          if (record.webPoolOnly) {
-            const sync = record.webPoolSync
-            return <Space direction="vertical" size={2}>
-              <Tag color={sync.ready ? 'success' : sync.imported ? 'warning' : 'default'}>
-                {sync.ready ? 'Web 远端已确认可用' : sync.imported ? '已入 Web 池，未确认可用' : 'Web 账号待上传'}
-              </Tag>
-              <Text type="secondary">{sync.imported ? `上次确认图片额度：${sync.quota ?? '-'}（非实时）` : '由 Web 号池巡检补传，不参与 Codex／RT 巡检'}</Text>
-            </Space>
-          }
           const auth = record.chatgptLocal?.auth || {}
           const subscription = record.chatgptLocal?.subscription || {}
           const codex = record.chatgptLocal?.codex || {}
@@ -1354,14 +1411,23 @@ export default function Accounts() {
           const codexMeta = codexStateMeta(codex.state)
           const cpaMeta = uploadSyncMeta(cpaSync)
           const sub2apiMeta = uploadSyncMeta(sub2apiSync)
+          const smsMeta = smsVerificationMeta(record.smsVerification)
+          const hasRefreshToken = Boolean(getRefreshToken(record))
 
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
+              {record.webPoolOnly ? <WebPoolSyncSummary sync={record.webPoolSync} /> : null}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 <Tag color={authMeta.color}>{authMeta.label}</Tag>
                 <Tag color={planTag.color}>{planTag.label}</Tag>
                 <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
               </div>
+              {record.webPoolOnly ? (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                  <Tag>{hasRefreshToken ? '有 RT' : '无 RT'}</Tag>
+                  <Tag color={smsMeta.color}>{smsMeta.label}</Tag>
+                </div>
+              ) : null}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                 <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', cpaSync)}>
                   CPA {cpaMeta.label}
@@ -1532,9 +1598,13 @@ export default function Accounts() {
   }))
 
   return (
-    <div>
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <Space>
+    <div className="admin-page admin-list-page">
+      <AdminPageHeader title={`${currentPlatform === 'chatgpt' ? 'ChatGPT' : currentPlatform} 账号`} kicker="ACCOUNTS"
+        description="按账号来源、当前能力与同步状态统一管理。"
+        extra={<><Text type="secondary">共 {total} 个账号</Text><Button icon={<ReloadOutlined spin={loading} />} onClick={load} aria-label="刷新账号" /></>} />
+      <Card className="admin-panel admin-list-controls">
+      <div className="admin-compact-toolbar">
+        <div className="admin-filter-group">
           <Input.Search
             placeholder="搜索邮箱..."
             allowClear
@@ -1565,15 +1635,17 @@ export default function Accounts() {
             />
           )}
           <Select
-            placeholder="是否接过码"
+            placeholder="接码记录筛选"
             allowClear
             style={{ width: 130 }}
             onChange={(v) => { setPage(1); setFilterSmsVerified(v || '') }}
             options={[
               { value: 'true', label: '已接过码' },
-              { value: 'false', label: '未接过码' },
+              { value: 'false', label: '无接码记录' },
             ]}
           />
+          <Button icon={<FilterOutlined />} type={dateFiltersOpen || createdAtStart || createdAtEnd ? 'primary' : 'default'} onClick={() => setDateFiltersOpen(!dateFiltersOpen)}>时间筛选</Button>
+          <div style={{ display: dateFiltersOpen || createdAtStart || createdAtEnd ? 'flex' : 'none', gap: 8, flexWrap: 'wrap' }}>
           <DatePicker
             showTime
             allowClear
@@ -1586,12 +1658,12 @@ export default function Accounts() {
             placeholder="结束时间"
             onChange={(value) => { setPage(1); setCreatedAtEnd(value ? value.toISOString() : '') }}
           />
-          <Text type="secondary">{total} 个账号</Text>
-          {selectedRowKeys.length > 0 && (
-            <Text type="success">已选 {selectedRowKeys.length} 个</Text>
-          )}
-        </Space>
-        <Space>
+          </div>
+        </div>
+      </div>
+      <div className="admin-save-bar">
+        <Text type={selectedRowKeys.length > 0 ? 'success' : 'secondary'} style={{ fontSize: 12 }}>{selectedRowKeys.length > 0 ? `已选 ${selectedRowKeys.length} 个账号` : '未勾选时，批量操作使用当前筛选范围'}</Text>
+        <Space wrap className="admin-action-group">
           {currentPlatform === 'chatgpt' && (
             <Dropdown
               trigger={['click']}
@@ -1704,11 +1776,12 @@ export default function Accounts() {
           </Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
         </Space>
       </div>
+      </Card>
 
-      <Table
+      <div ref={viewportRef} className="admin-table-viewport">
+      <Table className="admin-table"
         rowKey="id"
         columns={columns}
         dataSource={accounts}
@@ -1719,7 +1792,7 @@ export default function Accounts() {
           onChange: setSelectedRowKeys,
         }}
         pagination={{ total, current: page, pageSize, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'], onChange: (p, ps) => { setPage(p); setPageSize(ps) } }}
-        scroll={{ x: isChatgptPlatform ? 1300 : 980 }}
+        scroll={{ x: isChatgptPlatform ? 1300 : 980, y: bodyHeight }}
         onRow={(record) => ({
           onDoubleClick: () => {
             setCurrentAccount(record)
@@ -1727,6 +1800,7 @@ export default function Accounts() {
           },
         })}
       />
+      </div>
 
       <Modal
         title={`注册 ${currentPlatform}`}

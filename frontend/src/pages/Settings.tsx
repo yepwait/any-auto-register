@@ -27,6 +27,7 @@ import {
   useStoredMailImportSource,
 } from '@/lib/mailImport'
 import { apiFetch } from '@/lib/utils'
+import { AdminPageHeader } from '@/components/admin/AdminPage'
 
 const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
   mail_provider: [
@@ -1562,7 +1563,7 @@ export default function Settings() {
       : 0
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingBottom: showFloatingSaveButton ? 96 : 0 }}>
+    <div className="admin-page" style={{ paddingBottom: showFloatingSaveButton ? 96 : 0 }}>
       {showFloatingSaveButton && floatingSaveBounds && floatingSaveWidth > 0 ? (
         <div
           style={{
@@ -1592,13 +1593,10 @@ export default function Settings() {
           </div>
         </div>
       ) : null}
-      <div>
-        <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>全局配置</h1>
-        <p style={{ color: 'var(--text-muted)', marginTop: 4 }}>配置将持久化保存，注册任务自动使用</p>
-      </div>
+      <AdminPageHeader title="全局配置" kicker="SETTINGS" description="管理注册方式、邮箱与服务连接。" />
 
-      <div style={{ display: 'flex', gap: 24 }}>
-        <div style={{ width: 200 }}>
+      <div className="admin-settings-layout">
+        <div className="admin-settings-nav">
           <Tabs
             tabPosition="left"
             activeKey={activeTab}
@@ -1615,7 +1613,7 @@ export default function Settings() {
           />
         </div>
 
-        <div ref={contentPaneRef} style={{ flex: 1 }}>
+        <div ref={contentPaneRef} style={{ flex: 1, minWidth: 0 }}>
           {activeTab === 'integrations' ? (
             <IntegrationsPanel />
           ) : activeTab === 'security' ? (

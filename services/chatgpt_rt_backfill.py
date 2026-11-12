@@ -163,7 +163,10 @@ def apply_backfill_result(
     """把补号结果落到账号行上，返回实际写入的补丁。"""
     patch = build_extra_patch(result)
     extra = model.get_extra()
+    from services.chatgpt_account_purpose import web_access_token, mark_web_credentials_changed
+    previous_token = web_access_token(extra, model.token)
     extra.update(patch)
+    mark_web_credentials_changed(extra, previous_token, web_access_token(extra, model.token))
     model.set_extra(extra)
     if patch.get("access_token"):
         model.token = patch["access_token"]

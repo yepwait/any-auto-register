@@ -125,7 +125,7 @@ function AppContent() {
     {
       key: '/chatgpt-web-pool',
       icon: <GlobalOutlined />,
-      label: 'Web 池巡检',
+      label: 'Web 账号池',
     },
     {
       key: '/sms-stock',
@@ -167,14 +167,21 @@ function AppContent() {
   return (
     <ConfigProvider theme={currentTheme} locale={zhCN}>
       <AntdApp>
-      <Layout style={{ minHeight: '100vh' }}>
+      <Layout className="admin-app-layout">
         <Sider
           collapsible
+          breakpoint="lg"
+          collapsedWidth={64}
+          onBreakpoint={broken => { if (broken) setCollapsed(true) }}
           collapsed={collapsed}
           onCollapse={setCollapsed}
           style={{
             background: 'var(--bg-container)',
             borderRight: '1px solid var(--border)',
+            position: 'sticky',
+            top: 0,
+            height: '100dvh',
+            overflow: 'auto',
           }}
           width={220}
         >
@@ -187,7 +194,10 @@ function AppContent() {
               borderBottom: '1px solid var(--border)',
             }}
           >
-            <DashboardOutlined style={{ fontSize: 20, color: 'var(--accent)' }} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, color: 'var(--text)', fontWeight: 600, letterSpacing: -.2 }}>
+              <DashboardOutlined style={{ fontSize: 20, color: 'var(--accent-hover)' }} />
+              {!collapsed ? <span>账号管理</span> : null}
+            </div>
           </div>
           <Menu
             mode="inline"
@@ -242,8 +252,8 @@ function AppContent() {
           </div>
         </Sider>
         <Content
+          className="admin-shell-content"
           style={{
-            padding: 24,
             overflow: 'auto',
             background: 'var(--bg-layout)',
           }}

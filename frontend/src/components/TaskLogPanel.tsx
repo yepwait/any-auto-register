@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button, message, Space, Tag } from 'antd'
+import { Button, message, Space, Tag, Typography } from 'antd'
 import { CopyOutlined, DownloadOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
@@ -21,7 +21,7 @@ const KIND_TEXT: Record<TaskKind, { success: string; registered: string; total: 
   payment: { success: '支付成功', registered: '已处理', total: '总共账号', done: '支付任务完成' },
   inspection: { success: '巡检成功', registered: '已处理', total: '总共账号', done: '巡检完成' },
   sms_stock: { success: '接码账号补充成功', registered: '已尝试', total: '本轮尝试上限', done: '接码补库结束' },
-  chatgpt_web_pool: { success: 'Web 池补充成功', registered: '已尝试', total: '本轮注册尝试上限', done: 'Web 池巡检结束（以远端记录为准）' },
+  chatgpt_web_pool: { success: 'Web 池已确认可用', registered: '已尝试', total: '本任务尝试上限', done: 'Web 池检查结束（以任务结果为准）' },
   chatgpt_web_pool_register: { success: '邮箱注册成功', registered: '已尝试', total: '总共注册', done: 'Web 池邮箱注册子任务结束' },
 }
 
@@ -34,6 +34,8 @@ interface RegisterSummary {
 }
 
 interface LogPayload extends Partial<RegisterSummary> {
+  created_at?: number | string | null
+  meta?: { attempt_limit_unlimited?: boolean; outcome?: string; reason?: string; settings?: { max_attempts_per_run?: number; max_consecutive_failures?: number; daily_registration_limit?: number } }
   logs?: string[]
   line?: string
   sequence?: number
@@ -110,6 +112,7 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
   const [logWindow, setLogWindow] = useState<LogWindow>({ lines: [], offset: 0, count: 0 })
   const { lines } = logWindow
   const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
+  const [taskInfo, setTaskInfo] = useState<Pick<LogPayload, 'created_at' | 'meta'>>({})
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
   const [skipLoading, setSkipLoading] = useState(false)
@@ -274,6 +277,13 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
         linesDirty = true
       }
     }
+    const refreshTaskInfo = async () => {
+      if (kind !== 'chatgpt_web_pool') return
+      try {
+        const snapshot = await apiFetch(`/tasks/${taskId}`, { signal: controller.signal }) as LogPayload
+        if (!controller.signal.aborted) setTaskInfo({ created_at: snapshot.created_at, meta: snapshot.meta })
+      } catch { /* Existing log result remains; metadata is refreshed on reopen. */ }
+    }
     const finish = (status: string | undefined) => {
       if (controller.signal.aborted || doneNotified) return
       flush()
@@ -296,6 +306,7 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
         logCount = Math.max(nextSinceRef.current, cursorValue(snapshot.log_count) ?? 0)
         linesDirty = true
         updateCounters(snapshot)
+        setTaskInfo({ created_at: snapshot.created_at, meta: snapshot.meta })
         setStopRequested(Boolean(snapshot.control?.stop_requested))
         flush()
         if (isTerminalStatus(snapshot.status)) {
@@ -371,6 +382,7 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
           if (payload.done || event === 'done') {
             trimWindow()
             finish(payload.status)
+            void refreshTaskInfo()
             return true
           }
           return false
@@ -442,15 +454,30 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
       downloadRef.current = null
       if (lifecycleRef.current === controller) lifecycleRef.current = null
     }
-  }, [taskId])
+  }, [taskId, kind])
 
   useEffect(() => {
     if (!panelRef.current) return
     panelRef.current.scrollTop = panelRef.current.scrollHeight
   }, [lines])
 
+  const webTask = kind === 'chatgpt_web_pool'
+  const taskSettings = taskInfo.meta?.settings
+  const webLimit = taskSettings?.max_attempts_per_run
+  const totalLabel = webTask && (webLimit === 0 || taskInfo.meta?.attempt_limit_unlimited)
+    ? '不限' : webTask && typeof webLimit === 'number' ? webLimit : summary.total
+  const rawCreated = taskInfo.created_at
+  const numericCreated = typeof rawCreated === 'number' ? rawCreated : Number(rawCreated)
+  const createdDate = rawCreated ? Number.isFinite(numericCreated)
+    ? new Date(numericCreated > 1_000_000_000_000 ? numericCreated : numericCreated * 1000)
+    : new Date(String(rawCreated)) : null
+  const createdLabel = createdDate && !Number.isNaN(createdDate.getTime()) ? createdDate.toLocaleString('zh-CN') : '时间未提供'
+  const limitText = (value: number | undefined) => value === 0 ? '不限' : value === undefined ? '未记录' : String(value)
+  const quotaBlocked = webTask && taskInfo.meta?.outcome === 'quota_unknown'
   const footerText =
-    terminalStatus === 'done'
+    quotaBlocked && terminalStatus !== 'idle'
+      ? { text: '额度未知，本任务未继续注册', color: 'var(--warning)' }
+      : terminalStatus === 'done'
       ? { text: text.done, color: 'var(--success)' }
       : terminalStatus === 'stopped'
         ? { text: '任务已停止', color: 'var(--warning)' }
@@ -463,9 +490,13 @@ function TaskLogContent({ taskId, onDone, kind = 'register', operation }: TaskLo
       <Space wrap style={{ marginBottom: 8 }}>
         <Tag className="log-stat log-stat--success" bordered={false}>{text.success}：{summary.success}</Tag>
         <Tag className="log-stat log-stat--info" bordered={false}>{text.registered}：{summary.registered}</Tag>
-        <Tag className="log-stat" bordered={false}>{text.total}：{summary.total}</Tag>
+        <Tag className="log-stat" bordered={false}>{text.total}：{totalLabel}</Tag>
       </Space>
 
+      {webTask ? <Typography.Text type="secondary" style={{ fontSize: 12, marginBottom: 12 }}>
+        {terminalStatus === 'idle' ? '任务创建时间' : '历史任务'}：{createdLabel}；配置按创建时生效，不随当前表单变化。
+        {taskSettings ? ` 本任务每轮 ${limitText(taskSettings.max_attempts_per_run)}，连续失败 ${limitText(taskSettings.max_consecutive_failures)}，每日 ${limitText(taskSettings.daily_registration_limit)}。` : ''}
+      </Typography.Text> : null}
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <Space>
           <Button

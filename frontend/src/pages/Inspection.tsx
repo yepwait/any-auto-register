@@ -1,12 +1,12 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useState } from 'react'
 import {
   Alert,
   Badge,
   Button,
   Card,
   Col,
+  Collapse,
   Descriptions,
-  Divider,
   Drawer,
   Form,
   Input,
@@ -19,19 +19,40 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import {
   PlayCircleOutlined,
   ReloadOutlined,
   SaveOutlined,
-  SettingOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { AdminPageHeader, MetricCard } from '@/components/admin/AdminPage'
 import { usePollingRequest } from '@/hooks/usePollingRequest'
 
-const { Text, Title, Paragraph } = Typography
+const { Text, Paragraph } = Typography
+
+const ADVANCED_FIELDS: Partial<Record<keyof InspectionFormValues, string>> = {
+  concurrency: 'rate',
+  delay_seconds: 'rate',
+  backfill_rt_enabled: 'recovery',
+  backfill_allow_login: 'recovery',
+  only_missing_rt: 'recovery',
+  upload_cpa: 'upload',
+  upload_sub2api: 'upload',
+  chat2api_enabled: 'upload',
+  chat2api_protocol: 'upload',
+  chat2api_url: 'upload',
+  chat2api_token: 'upload',
+}
+
+type ValidationFailure = { errorFields: { name: (string | number)[] }[] }
+
+function isValidationFailure(error: unknown): error is ValidationFailure {
+  return Boolean(error && typeof error === 'object' && 'errorFields' in error && Array.isArray(error.errorFields))
+}
 
 const STATUS_OPTIONS = [
   { label: 'registered', value: 'registered' },
@@ -157,6 +178,17 @@ export default function Inspection() {
   const [status, setStatus] = useState<InspectionStatus>({ enabled: false, active: null, last_task: null, tasks: [] })
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [loadError, setLoadError] = useState('')
+  const [advancedKeys, setAdvancedKeys] = useState<string[]>([])
+
+  const revealValidationErrors = useCallback((error: ValidationFailure) => {
+    const sections = error.errorFields.flatMap(({ name }) => {
+      const section = ADVANCED_FIELDS[name[0] as keyof InspectionFormValues]
+      return section ? [section] : []
+    })
+    if (sections.length) setAdvancedKeys(keys => [...new Set([...keys, ...sections])])
+    const firstField = error.errorFields[0]?.name
+    if (firstField) requestAnimationFrame(() => form.scrollToField(firstField, { block: 'center', focus: true }))
+  }, [form])
 
   const initialize = useCallback(async (signal: AbortSignal) => {
     const [nextConfig, nextStatus] = await Promise.all([
@@ -187,7 +219,9 @@ export default function Inspection() {
     const signal = getSignal()
     if (!signal || signal.aborted) return false
     try {
-      const values = await form.validateFields()
+      await form.validateFields()
+      // Include preserved fields even when an advanced panel has never been opened.
+      const values = form.getFieldsValue(true) as InspectionFormValues
       if (signal.aborted) return false
       setSaving(true)
       const data: Record<string, unknown> = {
@@ -222,13 +256,17 @@ export default function Inspection() {
       message.success('巡检配置已保存')
       return true
     } catch (error) {
-      if (signal.aborted || (error && typeof error === 'object' && 'errorFields' in error)) return false
+      if (signal.aborted) return false
+      if (isValidationFailure(error)) {
+        revealValidationErrors(error)
+        return false
+      }
       message.error(error instanceof Error ? error.message : '保存巡检配置失败')
       return false
     } finally {
       if (!signal.aborted) setSaving(false)
     }
-  }, [form, getSignal])
+  }, [form, getSignal, revealValidationErrors])
 
   const runNow = async () => {
     const signal = getSignal()
@@ -237,7 +275,7 @@ export default function Inspection() {
     if (!saved || signal.aborted) return
     setRunning(true)
     try {
-      const values = form.getFieldsValue()
+      const values = form.getFieldsValue(true) as InspectionFormValues
       const result = await apiFetch('/inspection/run', {
         method: 'POST', signal,
         body: JSON.stringify({
@@ -269,43 +307,44 @@ export default function Inspection() {
   }
 
   const activeOrLast = status.active || status.last_task
-  const uploadCount = useMemo(
-    () => [config?.upload_cpa, config?.upload_sub2api, config?.chat2api_enabled].filter(Boolean).length,
-    [config],
-  )
+  const uploadTargets = [
+    config?.upload_cpa ? 'CPA' : '',
+    config?.upload_sub2api ? 'Sub2API' : '',
+    config?.chat2api_enabled ? 'Chat2API' : '',
+  ].filter(Boolean)
+  const taskErrors = activeOrLast?.error_count ?? activeOrLast?.errors?.length ?? 0
 
   const columns = [
     {
-      title: '任务',
-      dataIndex: 'id',
-      key: 'id',
-      render: (value: string) => <Text code style={{ fontSize: 11 }}>{value}</Text>,
+      title: '时间',
+      dataIndex: 'created_at',
+      key: 'created_at',
+      width: 190,
+      render: (value: TaskSnapshot['created_at'], row: TaskSnapshot) => (
+        <Tooltip title={`任务 ID：${row.id}`}>{formatTime(value)}</Tooltip>
+      ),
     },
     {
       title: '状态',
       dataIndex: 'status',
       key: 'status',
+      width: 100,
       render: (value: TaskSnapshot['status']) => statusTag(value),
     },
     {
-      title: '进度',
-      key: 'progress',
-      render: (_: unknown, row: TaskSnapshot) => `${row.progress || `${row.registered}/${row.total}`}`,
-    },
-    {
-      title: '成功 / 跳过 / 失败',
+      title: '处理结果',
       key: 'result',
-      render: (_: unknown, row: TaskSnapshot) => `${row.success || 0} / ${row.skipped || 0} / ${row.error_count ?? row.errors?.length ?? 0}`,
+      render: (_: unknown, row: TaskSnapshot) => (
+        <div>
+          <Text>成功 {row.success || 0} · 跳过 {row.skipped || 0} · 失败 {row.error_count ?? row.errors?.length ?? 0}</Text>
+          <div><Text type="secondary" style={{ fontSize: 12 }}>进度 {row.progress || `${row.registered}/${row.total}`}</Text></div>
+        </div>
+      ),
     },
     {
-      title: '创建时间',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      render: (value: TaskSnapshot['created_at']) => formatTime(value),
-    },
-    {
-      title: '操作',
+      title: '日志',
       key: 'action',
+      width: 110,
       render: (_: unknown, row: TaskSnapshot) => (
         <Button size="small" onClick={() => setLogTaskId(row.id)}>查看日志</Button>
       ),
@@ -319,162 +358,179 @@ export default function Inspection() {
     action={<Button onClick={() => void load()}>重试</Button>} />
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-        <div>
-          <Title level={3} style={{ margin: 0 }}>Codex／RT 巡检中心</Title>
-          <Paragraph type="secondary" style={{ margin: '4px 0 0' }}>
-            原 Codex／RT 巡检：定时测活、按需补 RT，并同步到 CPA、Sub2API 或自定义 Chat2API；排除 Web 池用途账号。
-            Web 图片账号池请使用 <Typography.Link href="/chatgpt-web-pool">独立 Web 池巡检入口</Typography.Link>，不在此处补 RT 或上传。
-          </Paragraph>
-        </div>
-        <Space>
+    <div className="admin-page">
+      <AdminPageHeader
+        title="Codex／RT 巡检"
+        description="定时测活、按需恢复 RT，并将通过检测的账号同步到已配置的上传目标。"
+        extra={<Space wrap>
           <Button icon={<ReloadOutlined />} onClick={() => void load()}>刷新</Button>
           <Button type="primary" icon={<PlayCircleOutlined />} loading={running} onClick={runNow}>立即巡检</Button>
-        </Space>
-      </div>
-
-      {loadError && <Alert type="error" showIcon message="状态刷新失败，以下可能是旧数据" description={loadError} />}
-      <Alert
-        type="info"
-        showIcon
-        message="原 Codex／RT 巡检不处理 Web 池用途账号"
-        description={<>Web 池账号不会进入本页的测活、补 RT 或上传流程；请前往 <Typography.Link href="/chatgpt-web-pool">Web 池巡检</Typography.Link> 管理远端图片额度和邮箱补号。原 Chat2API 仍按配置的 URL 发送标准 JSON 账号快照，请只填写可信的 HTTPS／内网地址并安全保存凭证。</>}
+        </Space>}
       />
 
-      <Row gutter={[16, 16]}>
-        <Col xs={24} xl={16}>
-          <Card title={<Space><SettingOutlined />巡检策略</Space>}>
-            <Form form={form} layout="vertical">
-              <Row gutter={16}>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="enabled" label="启用定时巡检" valuePropName="checked">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="interval_minutes" label="巡检间隔（分钟）" rules={[{ required: true, message: '请输入间隔' }]}>
-                    <InputNumber min={1} max={10080} style={{ width: '100%' }} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="concurrency" label="并发账号数">
-                    <InputNumber min={1} max={20} style={{ width: '100%' }} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="delay_seconds" label="账号启动间隔（秒）">
-                    <InputNumber min={0} max={3600} step={0.5} style={{ width: '100%' }} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="account_statuses" label="巡检账号状态">
-                    <Select mode="multiple" options={STATUS_OPTIONS} placeholder="选择要巡检的账号状态" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="max_accounts" label="每轮最多账号数" extra="0 表示不限制">
-                    <InputNumber min={0} max={5000} style={{ width: '100%' }} />
-                  </Form.Item>
-                </Col>
-                <Form.Item name="email_filter" hidden>
-                  <Input />
+      {loadError ? <Alert type="error" showIcon message="状态刷新失败，以下可能是旧数据" description={loadError} /> : null}
+
+      <div className="admin-metrics">
+        <MetricCard label="定时巡检" value={config.enabled ? '已开启' : '已关闭'} hint={`每 ${config.interval_minutes} 分钟检查`} tone={config.enabled ? 'success' : 'default'} />
+        <MetricCard label={status.active ? '当前任务' : '最近任务'} value={activeOrLast ? statusTag(activeOrLast.status) : '暂无'} hint={activeOrLast ? `进度 ${activeOrLast.progress || `${activeOrLast.registered}/${activeOrLast.total}`}` : '可立即发起一轮巡检'} tone={activeOrLast?.status === 'failed' ? 'danger' : 'default'} />
+        <MetricCard label={status.active ? '本轮成功' : '最近成功'} value={activeOrLast?.success ?? '—'} hint={activeOrLast ? `跳过 ${activeOrLast.skipped || 0} · 失败 ${taskErrors}` : '任务结束后显示结果'} tone="accent" />
+        <MetricCard label="上传目标" value={uploadTargets.length} hint={uploadTargets.length ? uploadTargets.join(' / ') : '在高级设置中按需启用'} />
+      </div>
+
+      <div className="admin-note">
+        本页不处理 Web 池用途账号；图片额度与邮箱补号请前往 <Typography.Link href="/chatgpt-web-pool">Web 池巡检</Typography.Link>。
+      </div>
+
+      <div className="admin-settings-grid">
+        <Card className="admin-panel" title="巡检策略">
+          <Form form={form} layout="vertical" preserve>
+            <Row gutter={16}>
+              <Col xs={24} sm={12}>
+                <Form.Item name="enabled" label="启用定时巡检" valuePropName="checked">
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
                 </Form.Item>
-              </Row>
+              </Col>
+              <Col xs={24} sm={12}>
+                <Form.Item name="interval_minutes" label="巡检间隔（分钟）" rules={[{ required: true, message: '请输入间隔' }]}>
+                  <InputNumber min={1} max={10080} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={12}>
+                <Form.Item name="probe_enabled" label="自动测活" valuePropName="checked">
+                  <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={12}>
+                <Form.Item name="max_accounts" label="每轮最多账号数" extra="0 表示不限制">
+                  <InputNumber min={0} max={5000} style={{ width: '100%' }} />
+                </Form.Item>
+              </Col>
+              <Col xs={24}>
+                <Form.Item name="account_statuses" label="巡检账号状态">
+                  <Select mode="multiple" options={STATUS_OPTIONS} placeholder="选择要巡检的账号状态" />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={12}>
+                <Form.Item name="email_filter" label="邮箱筛选" extra="留空表示不按邮箱筛选">
+                  <Input placeholder="输入邮箱关键字" allowClear />
+                </Form.Item>
+              </Col>
+              <Col xs={24} sm={12}>
+                <Form.Item name="only_sms_verified" label="仅含短信验证记录的账号" valuePropName="checked" extra="开启后会排除无短信记录但持有有效 RT 的账号">
+                  <Switch checkedChildren="是" unCheckedChildren="否" />
+                </Form.Item>
+              </Col>
+            </Row>
 
-              <Divider orientation="left">执行动作</Divider>
-              <Row gutter={[16, 8]}>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="probe_enabled" label="自动测活" valuePropName="checked">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="backfill_rt_enabled" label="自动补 RT／恢复失效认证" valuePropName="checked" extra="认证失效先重测，再按此开关恢复；恢复后必须再次测活通过才上传">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="only_missing_rt" label="只处理缺 RT 账号" valuePropName="checked">
-                    <Switch checkedChildren="是" unCheckedChildren="否" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="backfill_allow_login" label="补 RT 允许重新登录" valuePropName="checked">
-                    <Switch checkedChildren="允许" unCheckedChildren="禁止" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="only_sms_verified" label="只巡检已接过码账号" valuePropName="checked" extra="仅选择有短信验证记录的账号；无短信但已持有有效 RT 的账号会被排除，按需开启">
-                    <Switch checkedChildren="是" unCheckedChildren="否" />
-                  </Form.Item>
-                </Col>
-              </Row>
+            <Collapse
+              activeKey={advancedKeys}
+              onChange={keys => setAdvancedKeys(Array.isArray(keys) ? keys : [keys])}
+              items={[
+                {
+                  key: 'rate', label: '高级 · 并发与限速', forceRender: true,
+                  children: <Row gutter={16}>
+                    <Col xs={24} sm={12}>
+                      <Form.Item name="concurrency" label="并发账号数">
+                        <InputNumber min={1} max={20} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                    <Col xs={24} sm={12}>
+                      <Form.Item name="delay_seconds" label="账号启动间隔（秒）">
+                        <InputNumber min={0} max={3600} step={0.5} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Col>
+                  </Row>,
+                },
+                {
+                  key: 'recovery', label: '高级 · RT 恢复', forceRender: true,
+                  children: <>
+                    <Paragraph type="secondary">认证失效时先重测，再按下方开关恢复；恢复后必须再次测活通过才会上传。</Paragraph>
+                    <Row gutter={16}>
+                      <Col xs={24} sm={12}>
+                        <Form.Item name="backfill_rt_enabled" label="自动补 RT／恢复失效认证" valuePropName="checked">
+                          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} sm={12}>
+                        <Form.Item name="only_missing_rt" label="只处理缺 RT 账号" valuePropName="checked">
+                          <Switch checkedChildren="是" unCheckedChildren="否" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} sm={12}>
+                        <Form.Item name="backfill_allow_login" label="补 RT 允许重新登录" valuePropName="checked">
+                          <Switch checkedChildren="允许" unCheckedChildren="禁止" />
+                        </Form.Item>
+                      </Col>
+                    </Row>
+                  </>,
+                },
+                {
+                  key: 'upload', label: '高级 · 自动上传与接收凭证', forceRender: true,
+                  children: <>
+                    <Paragraph type="secondary">CPA、Sub2API 复用全局 URL / API Key；Chat2API 按下方协议发送账号快照，只填写可信的 HTTPS／内网地址并安全保管凭证。</Paragraph>
+                    <Row gutter={16}>
+                      <Col xs={24} sm={8}>
+                        <Form.Item name="upload_cpa" label="上传 CPA" valuePropName="checked">
+                          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} sm={8}>
+                        <Form.Item name="upload_sub2api" label="上传 Sub2API" valuePropName="checked">
+                          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24} sm={8}>
+                        <Form.Item name="chat2api_enabled" label="上传 Chat2API" valuePropName="checked">
+                          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24}>
+                        <Form.Item name="chat2api_protocol" label="Chat2API 协议">
+                          <Select options={[
+                            { label: 'chatgpt2api（批量 accounts）', value: 'chatgpt2api' },
+                            { label: 'webhook（单账号 JSON）', value: 'webhook' },
+                          ]} />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24}>
+                        <Form.Item name="chat2api_url" label="Chat2API JSON 接收地址">
+                          <Input placeholder="https://your-chat2api.example/api/import" />
+                        </Form.Item>
+                      </Col>
+                      <Col xs={24}>
+                        <Form.Item name="chat2api_token" label="Chat2API Token" extra={config.chat2api_token_configured ? `已配置 ${config.chat2api_token_masked || ''}；留空则保持不变` : '可选，保存后不会回显'}>
+                          <Input.Password placeholder="留空表示不修改现有 Token" autoComplete="off" />
+                        </Form.Item>
+                      </Col>
+                    </Row>
+                  </>,
+                },
+              ]}
+            />
 
-              <Divider orientation="left">自动上传</Divider>
-              <Row gutter={[16, 8]}>
-                <Col xs={24} sm={8}>
-                  <Form.Item name="upload_cpa" label="上传 CPA" valuePropName="checked">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={8}>
-                  <Form.Item name="upload_sub2api" label="上传 Sub2API" valuePropName="checked">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={8}>
-                  <Form.Item name="chat2api_enabled" label="上传 Chat2API" valuePropName="checked">
-                    <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24} sm={12}>
-                  <Form.Item name="chat2api_protocol" label="Chat2API 协议">
-                    <Select options={[
-                      { label: 'chatgpt2api（批量 accounts）', value: 'chatgpt2api' },
-                      { label: 'webhook（单账号 JSON）', value: 'webhook' },
-                    ]} />
-                  </Form.Item>
-                </Col>
-                <Col xs={24}>
-                  <Form.Item name="chat2api_url" label="Chat2API JSON 接收地址">
-                    <Input placeholder="https://your-chat2api.example/api/import" />
-                  </Form.Item>
-                </Col>
-                <Col xs={24}>
-                  <Form.Item name="chat2api_token" label="Chat2API Token" extra={config?.chat2api_token_configured ? `已配置 ${config.chat2api_token_masked || ''}；留空则保持不变` : '可选，保存后不会回显'}>
-                    <Input.Password placeholder="留空表示不修改现有 Token" />
-                  </Form.Item>
-                </Col>
-              </Row>
+            <div className="admin-save-bar" style={{ marginTop: 20 }}>
+              <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void save()}>保存配置</Button>
+              <Text type="secondary">启用并保存后立即检查；立即巡检会先保存本页配置。</Text>
+            </div>
+          </Form>
+        </Card>
 
-              <Space>
-                <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={() => void save()}>保存配置</Button>
-                <Text type="secondary">启用后会立即检查，之后按设定间隔运行。</Text>
-              </Space>
-            </Form>
-          </Card>
-        </Col>
+        <Card className="admin-panel" title="任务概览">
+          <Descriptions column={1} size="small">
+            <Descriptions.Item label="定时巡检">
+              <Badge status={config.enabled ? 'success' : 'default'} text={config.enabled ? '已开启' : '已关闭'} />
+            </Descriptions.Item>
+            <Descriptions.Item label="任务状态">{activeOrLast ? statusTag(activeOrLast.status) : '暂无任务'}</Descriptions.Item>
+            <Descriptions.Item label="任务时间">{formatTime(activeOrLast?.created_at)}</Descriptions.Item>
+            <Descriptions.Item label="处理进度">{activeOrLast ? activeOrLast.progress || `${activeOrLast.registered}/${activeOrLast.total}` : '—'}</Descriptions.Item>
+            <Descriptions.Item label="失败记录"><Text type={taskErrors ? 'danger' : 'secondary'}>{taskErrors} 条</Text></Descriptions.Item>
+          </Descriptions>
+          {activeOrLast ? <Button style={{ marginTop: 16 }} onClick={() => setLogTaskId(activeOrLast.id)}>查看{status.active ? '当前' : '最近'}日志</Button> : null}
+          <div className="admin-note" style={{ marginTop: 20 }}>概览显示已保存策略；高级区收起不会丢失 RT 恢复、上传目标或凭证配置。</div>
+        </Card>
+      </div>
 
-        <Col xs={24} xl={8}>
-          <Card title="运行概览">
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="定时巡检">
-                <Badge status={config?.enabled ? 'success' : 'default'} text={config?.enabled ? '已开启' : '已关闭'} />
-              </Descriptions.Item>
-              <Descriptions.Item label="巡检间隔">{config?.interval_minutes || 60} 分钟</Descriptions.Item>
-              <Descriptions.Item label="上传目标">{uploadCount > 0 ? `${uploadCount} 个已启用` : '未启用'}</Descriptions.Item>
-              <Descriptions.Item label="最近任务">{activeOrLast ? statusTag(activeOrLast.status) : '暂无'}</Descriptions.Item>
-            </Descriptions>
-            <Divider style={{ margin: '16px 0' }} />
-            <Text type="secondary" style={{ fontSize: 12 }}>
-              CPA、Sub2API 使用全局配置中的 URL/API Key；巡检页面只负责选择是否在本轮执行上传。
-            </Text>
-          </Card>
-        </Col>
-      </Row>
-
-      <Card title="巡检任务历史" extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => void load()}>刷新</Button>}>
+      <Card className="admin-panel" title="巡检任务历史" extra={<Text type="secondary">最近 {status.tasks?.length || 0} 次</Text>}>
         <Table<TaskSnapshot>
           rowKey="id"
           size="small"
@@ -482,18 +538,21 @@ export default function Inspection() {
           columns={columns}
           dataSource={status.tasks || []}
           locale={{ emptyText: '暂无巡检任务' }}
-          scroll={{ x: 760 }}
+          scroll={{ x: 640 }}
         />
       </Card>
 
       <Drawer
-        title={logTaskId ? `巡检日志 · ${logTaskId}` : '巡检日志'}
+        title="巡检日志"
         open={Boolean(logTaskId)}
         onClose={() => setLogTaskId(null)}
-        width={760}
+        width="min(760px, 100vw)"
         destroyOnClose
       >
-        {logTaskId ? <TaskLogPanel taskId={logTaskId} kind="inspection" /> : null}
+        {logTaskId ? <>
+          <Paragraph type="secondary" style={{ overflowWrap: 'anywhere' }}>任务 ID：<Text code>{logTaskId}</Text></Paragraph>
+          <TaskLogPanel taskId={logTaskId} kind="inspection" />
+        </> : null}
       </Drawer>
     </div>
   )

@@ -8,7 +8,9 @@ import {
   getPlatformLabel,
 } from '@/lib/platforms'
 import { apiFetch } from '@/lib/utils'
+import { AdminPageHeader } from '@/components/admin/AdminPage'
 import { usePollingRequest } from '@/hooks/usePollingRequest'
+import { useTableViewport } from '@/hooks/useTableViewport'
 
 const { Text } = Typography
 
@@ -33,6 +35,7 @@ interface TaskLogBatchDeleteResponse {
 }
 
 export default function TaskHistory() {
+  const { viewportRef, bodyHeight } = useTableViewport()
   const [logs, setLogs] = useState<TaskLogItem[]>([])
   const [total, setTotal] = useState(0)
   const [platform, setPlatform] = useState('')
@@ -123,13 +126,9 @@ export default function TaskHistory() {
   ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>任务历史</h1>
-          <p style={{ color: 'var(--text-muted)', marginTop: 4 }}>注册任务执行记录</p>
-        </div>
-        <Space>
+    <div className="admin-page admin-list-page">
+      <AdminPageHeader title="任务历史" kicker="HISTORY" description="查看账号处理结果与失败原因。" extra={
+        <Space wrap>
           <Text type="secondary">{total} 条记录</Text>
           {selectedRowKeys.length > 0 && <Text type="success">已选 {selectedRowKeys.length} 条</Text>}
           {selectedRowKeys.length > 0 && (
@@ -158,10 +157,11 @@ export default function TaskHistory() {
           />
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} loading={loading} />
         </Space>
-      </div>
+      } />
 
-      <Card>
-        <Table
+      <Card className="admin-panel admin-list-card">
+        <div ref={viewportRef} className="admin-table-viewport">
+        <Table className="admin-table" scroll={{ x: 700, y: bodyHeight }}
           rowKey="id"
           columns={columns}
           dataSource={logs}
@@ -182,6 +182,7 @@ export default function TaskHistory() {
             },
           }}
         />
+        </div>
       </Card>
     </div>
   )

@@ -242,6 +242,8 @@ def _merge_account_credentials(target: AccountModel, source: Any) -> None:
     """
     source_extra = _get_account_extra(source)
     target_extra = target.get_extra()
+    from services.chatgpt_account_purpose import web_access_token, mark_web_credentials_changed
+    previous_token = web_access_token(target_extra, target.token)
     for canonical, keys in (
         ("access_token", ("access_token", "accessToken", "token")),
         ("refresh_token", ("refresh_token", "refreshToken")),
@@ -255,6 +257,7 @@ def _merge_account_credentials(target: AccountModel, source: Any) -> None:
             target_extra[canonical] = value
             if canonical == "access_token":
                 target.token = value
+    mark_web_credentials_changed(target_extra, previous_token, web_access_token(target_extra, target.token))
     target.set_extra(target_extra)
 
 

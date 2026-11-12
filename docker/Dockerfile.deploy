@@ -1,0 +1,13 @@
+# Safe incremental deployment: inherit the already verified runtime/dependencies.
+# No browser downloads/npm/pip/build workload on the small production host.
+# Full clean builds may use Dockerfile.server instead.
+ARG RUNTIME_IMAGE=any-auto-register:solver
+FROM ${RUNTIME_IMAGE}
+WORKDIR /app
+ENV APP_ENABLE_SOLVER=0 SOLVER_THREADS=1 APP_TASK_WORKERS=1 APP_MAX_ACTIVE_TASKS=4 APP_UPLOAD_WORKERS=1 PYTHONDONTWRITEBYTECODE=1
+COPY . /app/
+RUN sed -i 's/\r$//' /app/docker/entrypoint.server.sh \
+    && chmod +x /app/docker/entrypoint.server.sh \
+    && node --version \
+    && python -c "import fastapi,sqlmodel,requests,curl_cffi"
+ENTRYPOINT ["/app/docker/entrypoint.server.sh"]

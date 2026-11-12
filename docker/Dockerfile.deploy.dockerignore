@@ -1,0 +1,16 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+frontend/node_modules
+frontend/dist
+account_manager.db
+*.db
+*.db-*
+.env
+data
+_ext_targets
+services/external_logs
+services/turnstile_solver/solver.log
+*.tar.gz
+*.tgz
